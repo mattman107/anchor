@@ -13,7 +13,7 @@
         "ghcr.io\/parkervcp\/yolks:debian": "ghcr.io\/parkervcp\/yolks:debian"
     },
     "file_denylist": [],
-    "startup": "export PORT={{SERVER_PORT}}; .\/deno run --allow-all --reload https:\/\/raw.githubusercontent.com\/garrettjoecox\/anchor\/main\/mod.ts",
+    "startup": "export PORT={{SERVER_PORT}}; .\/deno run --allow-all --reload https:\/\/raw.githubusercontent.com\/mattman107\/anchor\/main\/mod.ts",
     "config": {
         "files": "{}",
         "startup": "{\r\n    \"done\": \"change this part\"\r\n}",
