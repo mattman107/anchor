@@ -49,8 +49,12 @@ class Server {
   public rooms: Room[] = [];
 
   async start() {
-    this.listener = Deno.listen({ port: 43384 });
-    this.log("Server Started");
+    let mPort = 43384;
+    if (Number.isInteger(parseInt(Deno.args[0]))) {
+      mPort = parseInt(Deno.args[0]);
+    }
+    this.listener = Deno.listen({ port: mPort });
+    this.log("Server Started On Port "+ mPort);
     try {
       for await (const connection of this.listener) {
         try {
