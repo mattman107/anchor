@@ -180,7 +180,7 @@ class Server {
   }
 
   log(...data: any[]) {
-    console.log(`[Server]:`, ...data);
+    this.log(`[Server]:`, ...data);
   }
 }
 
@@ -350,7 +350,7 @@ class Client {
   }
 
   log(message: string) {
-    console.log(`[Client ${this.id}]: ${message}`);
+    this.log(`[Client ${this.id}]: ${message}`);
   }
 }
 
@@ -421,7 +421,7 @@ class Room {
   }
 
   log(message: string) {
-    console.log(`[Room ${this.id}]: ${message}`);
+    this.log(`[Room ${this.id}]: ${message}`);
   }
 }
 
@@ -490,7 +490,7 @@ async function stop(message = "Server restarting") {
       switch (command) {
         default:
         case "help": {
-          console.log(
+          this.log(
             `Available commands:
   help: Show this help message
   stats: Print server stats
@@ -507,28 +507,28 @@ async function stop(message = "Server restarting") {
           break;
         }
         case "roomCount": {
-          console.log(`Room count: ${server.rooms.length}`);
+          this.log(`Room count: ${server.rooms.length}`);
           break;
         }
         case "clientCount": {
-          console.log(`Client count: ${server.clients.length}`);
+          this.log(`Client count: ${server.clients.length}`);
           break;
         }
         case "quiet": {
           quietMode = !quietMode;
-          console.log(`Quiet mode: ${quietMode}`);
+          this.log(`Quiet mode: ${quietMode}`);
           break;
         }
         case "stats": {
           const { clientSHAs: _, ...stats } = server.stats;
-          console.log(stats);
+          this.log(stats);
           break;
         }
         case "list": {
           for (const room of server.rooms) {
-            console.log(`Room ${room.id}:`);
+            this.log(`Room ${room.id}:`);
             for (const client of room.clients) {
-              console.log(
+              this.log(
                 `  Client ${client.id}: ${JSON.stringify(client.data)}`,
               );
             }
@@ -544,7 +544,7 @@ async function stop(message = "Server restarting") {
           if (client) {
             sendDisable(client, message);
           } else {
-            console.log(`Client ${clientId} not found`);
+            this.log(`Client ${clientId} not found`);
           }
           break;
         }
@@ -564,7 +564,7 @@ async function stop(message = "Server restarting") {
           if (client) {
             sendServerMessage(client, message);
           } else {
-            console.log(`Client ${clientId} not found`);
+            this.log(`Client ${clientId} not found`);
           }
           break;
         }
