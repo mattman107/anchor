@@ -166,20 +166,6 @@ let stats: ServerStats = {
       }
     }
 
-    try {
-      // Write screen config so that it uses a fresh log file
-      await Deno.writeTextFile(
-        "./.screenrc",
-        `logfile "logs/${
-          new Date().toLocaleString().replace(/[\s,:/]/g, "-")
-        }.log"
-deflog on
-logfile flush 1`,
-      );
-    } catch (error) {
-      console.error("An error occured while writing screen config", error);
-    }
-
     if (stats.pid) {
       try {
         Deno.kill(stats.pid, "SIGINT");
