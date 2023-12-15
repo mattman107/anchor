@@ -189,24 +189,19 @@ logfile flush 1`,
     }
 
     const command = new Deno.Command(
-      "screen",
+      "./deno",
       {
         args: [
-          "-c",
-          "./.screenrc",
-          "-dmLS",
-          "anchor",
-          "deno",
           "run",
           "--allow-all",
-          "mod.ts",
+          "https://raw.githubusercontent.com/mattman107/anchor/main/mod.ts",
         ],
         env: {
           QUIET: "TRUE",
         },
-        stdout: "null",
-        stderr: "null",
-        stdin: "null",
+        stdout: "inherit",
+        stderr: "inherit",
+        stdin: "inherit",
       },
     );
     const process = command.spawn();
