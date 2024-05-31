@@ -72,12 +72,14 @@ class Server {
     gamesCompleted: 0,
     pid: Deno.pid,
   };
+  public addons = new Object();
 
   async start() {
     await this.parseStats();
 
     this.statsHeartbeat();
     this.clientHeartbeat();
+    this.loadAddons();
 
     this.startServer();
   }
@@ -122,6 +124,34 @@ class Server {
     setTimeout(() => {
       this.clientHeartbeat();
     }, 1000 * 30);
+  }
+
+  async loadAddons() {
+    try {
+      //get file names of addons
+      const addons = Deno.readDir("Addons");
+
+      for await (const addon of addons) {
+        //ensure file is .js or .ts
+        if (
+          addon.isFile && !addon.isDirectory && !addon.isSymlink &&
+          (addon.name.slice(-3) == ".ts" || addon.name.slice(-3) == ".js")
+        ) {
+          const funcs = await import("./Addons/".concat(addon.name));
+          // const funcs = Object.entries(
+          //   (await import("./Addons/".concat(addon.name))),
+          // );
+          this.addons[addon.name as keyof typeof this.addons] = funcs;
+          //console.log(this.addons);
+          console.log(`Loaded Addon: ${addon.name}`);
+        }
+      }
+
+      this.addons["test.ts" as keyof typeof this.addons]
+        ["t" as keyof typeof this.addons]("");
+    } catch (error) {
+      this.log(`Error loading addons: ${error.message}`);
+    }
   }
 
   async saveStats() {
