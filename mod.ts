@@ -53,6 +53,7 @@ interface ServerStats {
   onlineCount: number;
   gamesCompleted: number;
   pid: number;
+  addonsEnabled: Record<string, boolean>;
 }
 
 const port =
@@ -71,6 +72,7 @@ class Server {
     onlineCount: 0,
     gamesCompleted: 0,
     pid: Deno.pid,
+    addonsEnabled: {},
   };
   public addons = new Object();
 
@@ -132,26 +134,45 @@ class Server {
       const addons = Deno.readDir("Addons");
 
       for await (const addon of addons) {
+        const addonFileType = addon.name.slice(-3);
+        const addonName = addon.name.replace(addonFileType, "");
         //ensure file is .js or .ts
         if (
           addon.isFile && !addon.isDirectory && !addon.isSymlink &&
-          (addon.name.slice(-3) == ".ts" || addon.name.slice(-3) == ".js")
+          (addonFileType == ".ts" || addonFileType == ".js")
         ) {
           const funcs = await import("./Addons/".concat(addon.name));
-          // const funcs = Object.entries(
-          //   (await import("./Addons/".concat(addon.name))),
-          // );
-          this.addons[addon.name as keyof typeof this.addons] = funcs;
-          //console.log(this.addons);
-          console.log(`Loaded Addon: ${addon.name}`);
+
+          this.addons[addonName as keyof typeof this.addons] = funcs;
+
+          this.stats.addonsEnabled[addonName as keyof typeof String] =
+            this.stats.addonsEnabled[addonName as keyof typeof String] == false
+              ? this.stats.addonsEnabled[addonName as keyof typeof String]
+              : true;
+
+          this.log(`Loaded Addon: ${addonName}`);
         }
       }
-
-      this.addons["test.ts" as keyof typeof this.addons]
-        ["t" as keyof typeof this.addons]("");
+      //how to call addons function
+      //this.addons["test" as keyof typeof this.addons]["v" as keyof typeof this.addons]("");
     } catch (error) {
       this.log(`Error loading addons: ${error.message}`);
     }
+  }
+
+  checkAddonActive(addon: string, enabledCheck: boolean) {
+    if (addon in this.addons) {
+      if (enabledCheck) {
+        if (this.stats.addonsEnabled[addon as keyof typeof String]) {
+          return true;
+        } else {
+          return false;
+        }
+      } else {
+        return true;
+      }
+    }
+    return false;
   }
 
   async saveStats() {
@@ -541,7 +562,8 @@ async function stop(message = "Server restarting") {
   message <clientId> <message>: Send a message to a client
   messageAll <message>: Send a message to all clients
   disable <clientId> <message>: Disable anchor on a client
-  disableAll <message>: Disable anchor on all clients`,
+  disableAll <message>: Disable anchor on all clients
+  toggleAddon <addonName> <true/false> <message>: Enable or disable addon and send server message`,
           );
           break;
         }
@@ -611,6 +633,24 @@ async function stop(message = "Server restarting") {
           const message = args.join(" ");
           for (const client of server.clients) {
             sendServerMessage(client, message);
+          }
+          break;
+        }
+        case "toggleAddon": {
+          const [addon, value, ...messageParts] = args;
+          const message = messageParts.join(" ");
+
+          if (server.checkAddonActive(addon, false)) {
+            server.stats.addonsEnabled[addon as keyof typeof String] =
+              new RegExp("true").test(value);
+            for (const client of server.clients) {
+              if (message.replace(" ", "") != "") {
+                sendServerMessage(client, message);
+              }
+              console.log(`Addon ${addon} set to ${value}`);
+            }
+          } else {
+            console.log(`Addon ${addon} not found`);
           }
           break;
         }
