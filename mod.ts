@@ -1,51 +1,14 @@
 import { encodeHex } from "https://deno.land/std@0.208.0/encoding/hex.ts";
 import { customAlphabet } from "npm:nanoid@5.0.7";
+import {
+  deflate,
+  inflate,
+} from "https://deno.land/x/compress@v0.4.5/zlib/mod.ts";
+import { ClientData, Packet } from "./packets.ts";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
-
-type ClientData = Record<string, unknown>;
-
-interface BasePacket {
-  clientId?: number;
-  roomId?: string;
-  quiet?: boolean;
-  targetClientId?: number;
-}
-
-interface UpdateClientDataPacket extends BasePacket {
-  type: "UPDATE_CLIENT_DATA";
-  data: ClientData;
-}
-
-interface AllClientDataPacket extends BasePacket {
-  type: "ALL_CLIENT_DATA";
-  clients: ClientData[];
-}
-
-interface ServerMessagePacket extends BasePacket {
-  type: "SERVER_MESSAGE";
-  message: string;
-}
-
-interface DisableAnchorPacket extends BasePacket {
-  type: "DISABLE_ANCHOR";
-}
-
-interface OtherPackets extends BasePacket {
-  type:
-    | "REQUEST_SAVE_STATE"
-    | "PUSH_SAVE_STATE"
-    | "GAME_COMPLETE"
-    | "HEARTBEAT";
-}
-
-type Packet =
-  | UpdateClientDataPacket
-  | DisableAnchorPacket
-  | ServerMessagePacket
-  | AllClientDataPacket
-  | OtherPackets;
+const mb = 1_000_000;
 
 interface ServerStats {
   lastStatsHeartbeat: number;
@@ -53,6 +16,9 @@ interface ServerStats {
   onlineCount: number;
   gamesCompleted: number;
   pid: number;
+  compressedWins: number;
+  decompressedWins: number;
+  networkMegaBytesSaved: number;
   addonsEnabled: Record<string, boolean>;
 }
 
@@ -72,6 +38,9 @@ class Server {
     onlineCount: 0,
     gamesCompleted: 0,
     pid: Deno.pid,
+    compressedWins: 0,
+    decompressedWins: 0,
+    networkMegaBytesSaved: 0,
     addonsEnabled: {},
   };
   public addons = new Object();
@@ -91,6 +60,9 @@ class Server {
       const statsString = await Deno.readTextFile("./stats.json");
       this.stats = Object.assign(this.stats, JSON.parse(statsString));
       this.stats.pid = Deno.pid;
+      this.stats.compressedWins = 0;
+      this.stats.decompressedWins = 0;
+      this.stats.networkMegaBytesSaved = 0;
       this.log("Loaded stats file");
     } catch (_) {
       this.log("No stats file found");
@@ -114,10 +86,13 @@ class Server {
 
   async clientHeartbeat() {
     try {
+      const packetObject: Packet = {
+        type: "HEARTBEAT",
+      };
       await Promise.all(server.clients.map((client) => {
-        return client.sendPacket({
-          type: "HEARTBEAT",
-        }).catch((_) => {}); // Ignore errors, client will disconnect if it's a problem
+        return client.sendPacket(
+          packetObject,
+        ).catch((_) => {}); // Ignore errors, client will disconnect if it's a problem
       }));
     } catch (error) {
       this.log(`Error sending heartbeat to clients: ${error.message}`);
@@ -240,12 +215,29 @@ class Client {
   public connection: Deno.Conn;
   public server: Server;
   public room?: Room;
+  public handlesCompression: boolean;
 
   constructor(connection: Deno.Conn, server: Server) {
     this.connection = connection;
     this.server = server;
+    this.handlesCompression = false;
+    this.id = 0;
+    let go = false;
+    const activeIDs: number[] = [];
     const nanoid = customAlphabet("1234567890", 9);
-    this.id = parseInt(nanoid());
+
+    server.clients.forEach(function (value) {
+      activeIDs.push(value.id);
+    });
+
+    //ensure ID is not in use
+    while (!go) {
+      const testID = parseInt(nanoid());
+      if (!activeIDs.includes(testID)) {
+        go = true;
+        this.id = testID;
+      }
+    }
 
     // SHA256 to get a rough idea of how many unique players there are
     crypto.subtle.digest(
@@ -265,7 +257,7 @@ class Client {
   }
 
   async waitForData() {
-    const buffer = new Uint8Array(1024);
+    const buffer = new Uint8Array(5000);
     let data = new Uint8Array(0);
 
     while (true) {
@@ -291,31 +283,67 @@ class Client {
       // Handle all complete packets (while loop in case multiple packets were received at once)
       while (true) {
         const delimiterIndex = findDelimiterIndex(data);
-        if (delimiterIndex === -1) {
+        if (delimiterIndex[0] === -1) {
           break; // Incomplete packet, wait for more data
         }
 
         // Extract the packet
-        const packet = data.subarray(0, delimiterIndex);
-        data = data.subarray(delimiterIndex + 1);
+        const packet = data.subarray(0, delimiterIndex[0]);
+        data = data.subarray(delimiterIndex[0] + 1);
 
-        this.handlePacket(packet);
+        this.handlePacket(packet, delimiterIndex[1]);
       }
     }
   }
 
-  handlePacket(packet: Uint8Array) {
+  handleCompressionStats(uncompressedMb: number, compressedMb: number) {
+    if (compressedMb < uncompressedMb && uncompressedMb != -1) {
+      server.stats.compressedWins += 1;
+    } else {
+      server.stats.decompressedWins += 1;
+    }
+    server.stats.networkMegaBytesSaved += uncompressedMb - compressedMb;
+  }
+
+  handlePacket(packet: Uint8Array, compressed: boolean) {
     try {
-      const packetString = decoder.decode(packet);
-      const packetObject: Packet = JSON.parse(packetString);
+      let packetString = decoder.decode(packet);
+      let uncompPacket;
+
+      if (compressed) {
+        try {
+          uncompPacket = inflate(packet);
+
+          packetString = decoder.decode(uncompPacket);
+        } catch (e) {
+          this.log(`Error decompressing packet: ${e}`);
+        }
+      }
+
+      try {
+        JSON.parse(packetString);
+      } catch {
+        this.log(
+          `No packet could be extracted. Exiting handlePacket. ${packetString}`,
+        );
+
+        return;
+      }
+
+      const packetObject = JSON.parse(packetString);
       packetObject.clientId = this.id;
 
       if (!packetObject.quiet && !quietMode) {
-        this.log(`-> ${packetObject.type} packet`);
+        if (compressed) {
+          this.log(`-> ${packetObject.type} packet compressed`);
+        } else {
+          this.log(`-> ${packetObject.type} packet`);
+        }
       }
 
       if (packetObject.type === "UPDATE_CLIENT_DATA") {
         this.data = packetObject.data;
+        this.handlesCompression = packetObject.handlesCompression;
       }
 
       if (packetObject.type === "GAME_COMPLETE") {
@@ -364,11 +392,39 @@ class Client {
 
   async sendPacket(packetObject: Packet) {
     try {
-      if (!packetObject.quiet && !quietMode) {
-        this.log(`<- ${packetObject.type} packet`);
-      }
+      // if (!packetObject.quiet && !quietMode) {
+      //   this.log(`<- ${packetObject.type} packet`);
+      // }
+      //const packetString = JSON.stringify(packetObject);
+      //const packet = encoder.encode(packetString + "\0");
+      let out = `<- ${packetObject.type} packet`;
+      let packet;
       const packetString = JSON.stringify(packetObject);
-      const packet = encoder.encode(packetString + "\0");
+      let encodedPacketString = encoder.encode(packetString);
+
+      //compress if the client we are sending to supports it and if the packet should be compressed
+      //if (packetObject.comp && this.handlesCompression) {
+      if (false) {
+        out += ` compressed`;
+        packet = deflate(encodedPacketString);
+
+        this.handleCompressionStats(
+          encodedPacketString.length / mb,
+          packet.length / mb,
+        );
+
+        packet = concatUint8Arrays(
+          packet,
+          new Uint8Array([0]),
+        );
+      } else {
+        encodedPacketString = encoder.encode(packetString + "\0");
+        packet = encodedPacketString;
+      }
+
+      if (!packetObject.quiet && !quietMode) {
+        this.log(out);
+      }
 
       //Only write if the player we are sending the packet to's writer is not locked
       if (!this.connection.writable.locked) {
@@ -462,7 +518,9 @@ class Room {
         })),
       };
 
-      client.sendPacket(packetObject);
+      client.sendPacket(
+        packetObject,
+      );
     }
   }
 
@@ -473,7 +531,9 @@ class Room {
 
     for (const client of this.clients) {
       if (client !== sender) {
-        client.sendPacket(packetObject);
+        client.sendPacket(
+          packetObject,
+        );
       }
     }
   }
@@ -490,13 +550,31 @@ function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
   return result;
 }
 
-function findDelimiterIndex(data: Uint8Array): number {
+function findDelimiterIndex(data: Uint8Array): [number, boolean] {
   for (let i = 0; i < data.length; i++) {
     if (data[i] === 0 /* null terminator */) {
-      return i;
+      const packet = data.subarray(0, i);
+
+      //try to parse for json without compression
+      try {
+        JSON.parse(decoder.decode(packet));
+        return [i, false];
+      } catch {
+        console.log(decoder.decode(packet));
+      }
+
+      //try to parse for json with compression. If fails continue to next iteration of loop because there could still be compressed data with an end somewhere further in the array.
+      try {
+        console.log(`Decomp: ${decoder.decode(inflate(packet))}`);
+        JSON.parse(decoder.decode(inflate(packet)));
+        return [i, true];
+      } catch {
+        console.log("not compressed");
+      }
     }
   }
-  return -1;
+
+  return [-1, false];
 }
 
 const server = new Server();
@@ -512,19 +590,25 @@ globalThis.addEventListener("unhandledrejection", (e) => {
 });
 
 function sendServerMessage(client: Client, message: string) {
-  return client.sendPacket({
+  const packetObject: Packet = {
     type: "SERVER_MESSAGE",
     message,
-  });
+  };
+  return client.sendPacket(
+    packetObject,
+  );
 }
 
 function sendDisable(client: Client, message: string) {
   sendServerMessage(client, message)
-    .finally(() =>
-      client.sendPacket({
+    .finally(() => {
+      const packetObject: Packet = {
         type: "DISABLE_ANCHOR",
-      })
-    );
+      };
+      client.sendPacket(
+        packetObject,
+      );
+    });
 }
 
 async function stop(message = "Server restarting") {
