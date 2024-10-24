@@ -227,6 +227,10 @@ func (client *Client) sendPacket(packetObject map[string]interface{}){
 	}
 
 	_, wErr := (*client.connection).Write(packet)
+	if(errors.Is(wErr, net.ErrClosed)){
+		return
+	}
+	
 	if(wErr != nil){
 		client.log("Error sending packet: " + wErr.Error())
 		go client.disconnect()

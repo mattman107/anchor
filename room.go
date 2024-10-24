@@ -44,10 +44,6 @@ func (room *Room) broadcastAllClientData(){
 			"roomId": room.id,
 			"clients": clientsDataObject,
 		}
-		fmt.Println(client.id)
-		fmt.Println(client.data)
-		fmt.Println(clientsDataObject)
-		fmt.Println()
 		go client.sendPacket(packetObject)
 	}
 }
