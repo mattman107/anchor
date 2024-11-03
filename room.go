@@ -3,19 +3,21 @@ package main
 import (
 	"fmt"
 	"slices"
+	"time"
 )
 
 type Room struct{
 	id string
 	server *Server
 	clients *[]Client
+	clientSliceLock bool
 	requestingStateClients *[]Client
 }
 
 func newRoom(id string, server *Server) (Room){
 	clients := make([]Client,0)
 	requetingClients := make([]Client,0)
-	room := Room{id: id, server: server, clients: &clients, requestingStateClients: &requetingClients}
+	room := Room{id: id, server: server, clients: &clients, requestingStateClients: &requetingClients, clientSliceLock: false}
 	room.log("Created")
 	return room
 }
@@ -24,6 +26,8 @@ func (room *Room) broadcastAllClientData(){
 	if(!quietMode){
 		room.log("<- ALL_CLIENT_DATA packet")
 	}
+
+	room.clientSliceLock = true
 
 	for i := range (*room.clients){
 		client := &(*room.clients)[i]
@@ -46,6 +50,8 @@ func (room *Room) broadcastAllClientData(){
 		}
 		go client.sendPacket(packetObject)
 	}
+
+	room.clientSliceLock = false
 }
 
 func (room *Room) broadcastPacket(packetObject map[string]interface{}, sender *Client){
@@ -75,6 +81,19 @@ func (room *Room) addClient(client *Client){
 }
 
 func (room *Room) removeClient(client *Client){
+
+	//wait until client slice is unlocked
+	for{
+		
+		if(!room.clientSliceLock){
+			break
+		}
+		if(!quietMode){
+			room.log("Client slice locked. Waiting to remove " + fmt.Sprint(client.id))
+		}
+		time.Sleep(time.Duration(1) * time.Second)
+	}
+
 	room.log("Removing client " + fmt.Sprint(client.id))
 	
 	index := slices.IndexFunc((*room.clients), func(c Client) bool { return c.id == client.id })
