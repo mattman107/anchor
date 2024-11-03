@@ -69,7 +69,10 @@ func (client *Client) ClientStuff(){
 			}
 			client.disconnect()
 			break
+		case <- client.shutdown:
+			return
 		}
+		
 	}
 }
 
@@ -84,7 +87,13 @@ func (client *Client) waitForData(dataChannel chan map[string]interface{}, error
 		default:
 			(*client.connection).SetReadDeadline(time.Now().Add(2 * time.Second))
 			count, err := (*client.connection).Read(buffer)
-			if(errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, net.ErrClosed)){
+
+			if(errors.Is(err, net.ErrClosed)){
+				client.disconnect()
+				continue
+			}
+			
+			if(errors.Is(err, os.ErrDeadlineExceeded)){
 				continue
 			}
 
@@ -119,11 +128,11 @@ func (client *Client) waitForData(dataChannel chan map[string]interface{}, error
 
 func (client *Client) clientHearbeat(){
 	for{
+		time.Sleep(time.Duration(30) * time.Second)
 		select {
 		case <- client.shutdown:
 			return
 		default: 
-			time.Sleep(time.Duration(30) * time.Second)
 			go client.sendPacket(map[string]interface{}{
 				"type": "Heartbeat",
 			})
@@ -239,8 +248,12 @@ func (client *Client) sendPacket(packetObject map[string]interface{}){
 }
 
 func (client *Client) disconnect(){
+	//send blank data to shutdown channel to stop client goroutines
 	go func(){
-		client.shutdown <- struct{}{}
+		//needs to be sent a couple of times to ensure all goroutines waiting for shutdown channel recieve the signal
+		for i := 0; i < 3; i++{
+			client.shutdown <- struct{}{}
+		}
 	}()
 
 	if(client.room != nil){
