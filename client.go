@@ -3,241 +3,87 @@ package main
 import (
 	"log"
 	"net"
-	"sync"
 	"time"
-
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const sendQueueSize = 256
 
+// Client is a member of a room. Every field except id is owned by the room's
+// goroutine: it is only touched from closures running on the room's event
+// loop, which is why this file has no locks at all. The one exception is
+// writeLoop, which runs per connection and communicates back by posting
+// events to the room.
 type Client struct {
-	id           uint64
+	id   uint64
+	room *Room
+
 	conn         net.Conn
-	sendCh       chan string // Outgoing packet queue, drained by the connection's writeLoop
-	server       *Server
-	room         *Room
+	sendCh       chan string // outgoing queue, drained by the connection's writeLoop
 	team         *Team
-	state        string     // Client state, current scene, etc.
-	mu           sync.Mutex // Mutex for safely updating state
+	state        string // opaque client state blob, relayed in ALL_CLIENT_STATE
+	saveLoaded   bool   // mirrored out of the blob for REQUEST_TEAM_STATE decisions
+	online       bool
 	lastActivity time.Time
 }
 
-func (c *Client) attachConnLocked(conn net.Conn) {
-	c.conn = conn
-	c.sendCh = make(chan string, sendQueueSize)
-	go c.writeLoop(conn, c.sendCh)
+// send enqueues a packet for the client's writer goroutine. It never blocks; a
+// full queue means the client stopped draining its socket, and the session is
+// torn down. Must run on the room goroutine — which also makes the queue-full
+// disconnect a plain function call instead of a lock-ordering puzzle.
+func (c *Client) send(packetType, packet string, quiet bool) {
+	if c.sendCh == nil {
+		return
+	}
+
+	if !c.room.server.quietMode.Load() && !quiet {
+		log.Printf("Client %d <- Server: %s\n", c.id, packetType)
+	}
+
+	select {
+	case c.sendCh <- packet:
+		c.lastActivity = time.Now()
+	default:
+		log.Printf("Client %d send queue full, disconnecting\n", c.id)
+		c.room.disconnect(c, c.conn)
+	}
 }
 
+func (c *Client) sendEnvelope(env *Envelope) {
+	c.send(env.Type, env.Raw, env.Quiet)
+}
+
+// sendServerMessage shows a message to the player in-game.
+func (c *Client) sendServerMessage(message string) {
+	if message == "" {
+		message = "You have been disconnected by the server. Try to connect again in a bit!"
+	}
+	c.send(PacketServerMessage, marshalPacket(serverMessagePacket{Type: PacketServerMessage, Message: message}), false)
+}
+
+// disable tells the client to turn anchor off, then drops the connection.
+// The writer flushes both queued packets before closing the socket.
+func (c *Client) disable(message string) {
+	c.sendServerMessage(message)
+	c.send(PacketDisableAnchor, marshalPacket(disableAnchorPacket{Type: PacketDisableAnchor}), false)
+	c.room.disconnect(c, c.conn)
+}
+
+// writeLoop is the sole writer for one connection, keeping packets in enqueue
+// order. It owns closing the connection: it exits when the channel is closed
+// (after flushing what was queued) or when a write fails.
 func (c *Client) writeLoop(conn net.Conn, ch chan string) {
 	defer conn.Close()
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Panic in writeLoop for client %d: %v", c.id, r)
-		}
-	}()
+	defer logPanic("writeLoop")
 
 	for packet := range ch {
-		// Set write deadline to prevent blocking on dead connections
+		// A fresh deadline before every write, so a dead connection can't
+		// stall the loop
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		_, err := conn.Write(append([]byte(packet), 0))
-		conn.SetWriteDeadline(time.Time{}) // Clear deadline
-
-		if err != nil {
-			c.disconnectConn(conn)
+		if err := writeFrame(conn, packet); err != nil {
+			// Hand cleanup to the room goroutine; blocking here is fine,
+			// this goroutine has nothing left to do
+			c.room.post(func() { c.room.disconnect(c, conn) })
 			return
 		}
-
-		c.mu.Lock()
-		c.lastActivity = time.Now()
-		c.mu.Unlock()
 	}
-}
-
-func (c *Client) handlePacket(packet string) {
-	c.mu.Lock()
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
-
-	packetType := gjson.Get(packet, "type").String()
-
-	if !c.server.quietMode.Load() && !gjson.Get(packet, "quiet").Exists() {
-		log.Printf("Client %d -> Server: %s\n", c.id, packetType)
-	}
-
-	if packetType == "UPDATE_CLIENT_STATE" {
-		team := c.room.findOrCreateTeam(gjson.Get(packet, "state.teamId").String())
-
-		c.mu.Lock()
-		c.state = gjson.Get(packet, "state").Raw
-		c.state, _ = sjson.Set(c.state, "clientId", c.id)
-		c.team = team
-		c.mu.Unlock()
-	}
-
-	if packetType == "GAME_COMPLETE" {
-		c.server.gameCompleteCount.Add(1)
-	}
-
-	targetClientId := gjson.Get(packet, "targetClientId")
-
-	if targetClientId.Exists() {
-		value, ok := c.room.clients.Load(targetClientId.Uint())
-		if ok {
-			targetClient := value.(*Client)
-			targetClient.sendPacket(packet)
-		}
-		return
-	}
-
-	targetTeamId := gjson.Get(packet, "targetTeamId")
-
-	if packetType == "REQUEST_TEAM_STATE" {
-		if !targetTeamId.Exists() {
-			return
-		}
-
-		team := c.room.findOrCreateTeam(targetTeamId.String())
-		teamMemberOnline := false
-		c.room.clients.Range(func(_, value interface{}) bool {
-			client := value.(*Client)
-			client.mu.Lock()
-			if client.id != c.id && client.conn != nil && client.team == team && gjson.Get(client.state, "isSaveLoaded").Bool() {
-				teamMemberOnline = true
-			}
-			client.mu.Unlock()
-			return true
-		})
-
-		if teamMemberOnline {
-			team.mu.Lock()
-			team.clientIdsRequestingState = append(team.clientIdsRequestingState, c.id)
-			team.mu.Unlock()
-			team.broadcastPacket(packet)
-			return
-		}
-
-		// Teammate is offline, see if we have a saved state for the team
-		outgoingPacket := `{"type": "UPDATE_TEAM_STATE"}`
-		team.mu.Lock()
-		if team.state != "{}" {
-			outgoingPacket, _ = sjson.SetRaw(outgoingPacket, "state", team.state)
-		}
-		withQueue, _ := sjson.Set(outgoingPacket, "queue", team.queue)
-		queued := len(team.queue)
-		team.mu.Unlock()
-
-		if len(withQueue) <= MAX_PACKET_SIZE {
-			outgoingPacket = withQueue
-		} else {
-			log.Printf("Team %s state plus %d queued packets is %d bytes, over the %d byte limit; sending state only",
-				team.id, queued, len(withQueue), MAX_PACKET_SIZE)
-			outgoingPacket, _ = sjson.Set(outgoingPacket, "queue", []string{})
-		}
-
-		c.sendPacket(outgoingPacket)
-	} else if packetType == "UPDATE_TEAM_STATE" {
-		if !targetTeamId.Exists() {
-			return
-		}
-
-		team := c.room.findOrCreateTeam(targetTeamId.String())
-
-		team.mu.Lock()
-		clientIdsRequestingState := team.clientIdsRequestingState
-		team.state = gjson.Get(packet, "state").Raw
-		team.queue = []string{}
-		team.droppedFromQueue = 0
-		team.clientIdsRequestingState = []uint64{}
-		team.mu.Unlock()
-
-		for _, clientId := range clientIdsRequestingState {
-			if value, ok := c.room.clients.Load(clientId); ok {
-				client := value.(*Client)
-				client.sendPacket(packet)
-			}
-		}
-
-	} else if packetType == "UPDATE_ROOM_STATE" {
-		c.room.mu.Lock()
-		c.room.state = gjson.Get(packet, "state").Raw
-		c.room.mu.Unlock()
-		c.room.broadcastPacket(packet)
-	} else if targetTeamId.Exists() {
-		team := c.room.findOrCreateTeam(targetTeamId.String())
-		addToQueue := gjson.Get(packet, "addToQueue")
-
-		if addToQueue.Exists() && addToQueue.Bool() {
-			team.enqueue(packet)
-		}
-
-		team.broadcastPacket(packet)
-	} else {
-		c.room.broadcastPacket(packet)
-	}
-}
-
-func (c *Client) sendPacket(packet string) {
-	if !c.server.quietMode.Load() && !gjson.Get(packet, "quiet").Exists() {
-		log.Printf("Client %d <- Server: %s\n", c.id, gjson.Get(packet, "type").String())
-	}
-
-	// Lock to prevent race condition with disconnect
-	c.mu.Lock()
-	conn := c.conn
-	ch := c.sendCh
-	full := false
-	if conn != nil && ch != nil {
-		select {
-		case ch <- packet:
-		default:
-			full = true
-		}
-	}
-	c.mu.Unlock()
-
-	if full {
-		// Queue full, the client isn't draining its socket, consider the session dead
-		log.Printf("Client %d send queue full, disconnecting\n", c.id)
-		c.disconnectConn(conn)
-	}
-}
-
-func (c *Client) disconnect() {
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	c.disconnectConn(conn)
-}
-
-func (c *Client) disconnectConn(conn net.Conn) {
-	if conn == nil {
-		return
-	}
-
-	c.mu.Lock()
-	if c.conn != conn {
-		c.mu.Unlock()
-		return
-	}
-	c.state, _ = sjson.Set(c.state, "online", false)
-	c.state, _ = sjson.Set(c.state, "isSaveLoaded", false)
-	c.conn = nil
-	if c.sendCh != nil {
-		close(c.sendCh)
-		c.sendCh = nil
-	}
-	c.mu.Unlock()
-
-	c.server.onlineClients.Delete(c.id)
-}
-
-func (c *Client) sendRoomState() {
-	c.room.mu.Lock()
-	packet, _ := sjson.SetRaw(`{"type":"UPDATE_ROOM_STATE"}`, "state", c.room.state)
-	c.room.mu.Unlock()
-
-	c.sendPacket(packet)
 }

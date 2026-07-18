@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"os"
@@ -12,12 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
-const JSON_TEMPLATE = `{"gameCompleteCount":0,"onlineCount":0,"lastStatsHeartbeat":"","uniqueCount":0,"pid":0}`
 const INACTIVITY_TIMEOUT = 5 * time.Minute
 const HEARTBEAT = 30 * time.Second
 const MAX_PACKET_SIZE = 8 * 1024 * 1024
@@ -26,19 +22,30 @@ const INITIAL_SCAN_BUFFER = 64 * 1024
 type Server struct {
 	listener          net.Listener
 	quietMode         atomic.Bool
-	onlineClients     sync.Map
-	rooms             sync.Map
 	gameCompleteCount atomic.Uint64
 	nextClientId      atomic.Uint64
+
+	// mu guards only the two registries below. All game state lives inside
+	// rooms, owned by their goroutines; nothing ever holds mu while waiting on
+	// a room, so there is no lock ordering to get wrong.
+	mu          sync.Mutex
+	rooms       map[string]*Room
+	clientRooms map[uint64]*Room // which room each *online* client is in
+}
+
+// Stats is the schema of stats.json, also read by the discord bot.
+type Stats struct {
+	GameCompleteCount  uint64 `json:"gameCompleteCount"`
+	OnlineCount        int    `json:"onlineCount"`
+	LastStatsHeartbeat int64  `json:"lastStatsHeartbeat"`
+	UniqueCount        uint64 `json:"uniqueCount"`
+	Pid                int    `json:"pid"`
 }
 
 func NewServer() *Server {
 	s := &Server{
-		onlineClients:     sync.Map{},
-		quietMode:         atomic.Bool{},
-		rooms:             sync.Map{},
-		gameCompleteCount: atomic.Uint64{},
-		nextClientId:      atomic.Uint64{},
+		rooms:       map[string]*Room{},
+		clientRooms: map[uint64]*Room{},
 	}
 
 	s.quietMode.Store(true)
@@ -46,17 +53,18 @@ func NewServer() *Server {
 	return s
 }
 
-func (s *Server) Start(errChan chan error) {
+func (s *Server) Start() {
 	listener, err := net.Listen("tcp", ":43383")
 	if err != nil {
 		log.Fatal(err)
 	}
 	s.listener = listener
 
-	go s.cleanupInactiveRooms(errChan)
-	go s.heartbeat(errChan)
-	go s.parseStats(errChan)
-	go s.statsHeartbeat(errChan)
+	s.parseStats()
+
+	go s.runPeriodic("cleanupInactiveRooms", s.cleanupInactiveRooms)
+	go s.runPeriodic("heartbeat", s.heartbeat)
+	go s.runPeriodic("statsHeartbeat", s.saveStats)
 
 	log.Println("Server running on :43383")
 	log.Println("Quiet mode:", s.quietMode.Load())
@@ -69,175 +77,202 @@ func (s *Server) Start(errChan chan error) {
 				break
 			}
 			log.Println("Error accepting connection:", err)
-			conn.Close()
 			continue
 		}
 
-		go s.handleConnection(conn, errChan)
+		go s.handleConnection(conn)
 	}
 }
 
-func (s *Server) parseStats(errChan chan error) {
-	defer func() {
-		if r := recover(); r != nil {
-			errChan <- fmt.Errorf("panic in parseStats: %v", r)
-		}
-	}()
+// logPanic recovers a panic and logs it. Used as `defer logPanic("name")` in
+// goroutines that must not take the whole server down.
+func logPanic(name string) {
+	if r := recover(); r != nil {
+		log.Printf("Panic in %s: %v", name, r)
+	}
+}
 
-	value, err := os.ReadFile("stats.json")
+// runPeriodic runs fn every HEARTBEAT until the process exits.
+func (s *Server) runPeriodic(name string, fn func()) {
+	defer logPanic(name)
+
+	ticker := time.NewTicker(HEARTBEAT)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		fn()
+	}
+}
+
+// Registry helpers. These take mu briefly and never call into a room while
+// holding it.
+
+func (s *Server) findOrCreateRoom(roomId string, ownerClientId uint64, roomState string) *Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	room, ok := s.rooms[roomId]
+	if !ok {
+		room = NewRoom(s, roomId, ownerClientId, roomState)
+		s.rooms[roomId] = room
+		go room.run()
+	}
+
+	return room
+}
+
+func (s *Server) removeRoom(roomId string, room *Room) {
+	s.mu.Lock()
+	if s.rooms[roomId] == room {
+		delete(s.rooms, roomId)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) snapshotRooms() []*Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, room := range s.rooms {
+		rooms = append(rooms, room)
+	}
+
+	return rooms
+}
+
+func (s *Server) setClientRoom(clientId uint64, room *Room) {
+	s.mu.Lock()
+	s.clientRooms[clientId] = room
+	s.mu.Unlock()
+}
+
+func (s *Server) clearClientRoom(clientId uint64, room *Room) {
+	s.mu.Lock()
+	if s.clientRooms[clientId] == room {
+		delete(s.clientRooms, clientId)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) onlineCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.clientRooms)
+}
+
+func (s *Server) roomCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.rooms)
+}
+
+func (s *Server) parseStats() {
+	data, err := os.ReadFile("stats.json")
 	if err != nil {
 		log.Println("Error reading stats.json file:", err)
 	}
 
-	//input values into their repective fields of the server
-	s.gameCompleteCount.Store(gjson.Get(string(value), "gameCompleteCount").Uint())
-	s.nextClientId.Store(gjson.Get(string(value), "uniqueCount").Uint())
+	var stats Stats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		log.Println("Error parsing stats.json:", err)
+	}
+	s.gameCompleteCount.Store(stats.GameCompleteCount)
+	s.nextClientId.Store(stats.UniqueCount)
 
 	// Save stats immediately to update lastStatsHeartbeat
 	s.saveStats()
 }
 
-func (s *Server) onlineCount() int {
-	var count int
-	s.onlineClients.Range(func(_, _ interface{}) bool {
-		count++
-		return true
-	})
-	return count
-}
-
 func (s *Server) saveStats() {
-	value, _ := sjson.Set(JSON_TEMPLATE, "gameCompleteCount", s.gameCompleteCount.Load())
-	value, _ = sjson.Set(value, "uniqueCount", s.nextClientId.Load())
-	value, _ = sjson.Set(value, "onlineCount", s.onlineCount())
-	value, _ = sjson.Set(value, "lastStatsHeartbeat", time.Now().UnixMilli())
-	value, _ = sjson.Set(value, "pid", os.Getpid())
+	data, _ := json.Marshal(Stats{
+		GameCompleteCount:  s.gameCompleteCount.Load(),
+		OnlineCount:        s.onlineCount(),
+		LastStatsHeartbeat: time.Now().UnixMilli(),
+		UniqueCount:        s.nextClientId.Load(),
+		Pid:                os.Getpid(),
+	})
 
-	err := os.WriteFile("./stats.json", []byte(value), 0644)
-
-	if err != nil {
+	if err := os.WriteFile("./stats.json", data, 0644); err != nil {
 		log.Println("Error writing json to file: ", err)
 	}
 }
 
-func (s *Server) cleanupInactiveRooms(errChan chan error) {
-	ticker := time.NewTicker(HEARTBEAT)
-	defer ticker.Stop()
-	defer func() {
-		if r := recover(); r != nil {
-			errChan <- fmt.Errorf("panic in cleanupInactiveRooms: %v", r)
-		}
-	}()
+// shutdown persists stats, stops accepting connections, and exits.
+func (s *Server) shutdown() {
+	s.saveStats()
+	s.listener.Close()
+	os.Exit(0)
+}
 
-	for range ticker.C {
-		s.rooms.Range(func(id, value interface{}) bool {
-			room := value.(*Room)
-			lastActivity := room.GetLastActivity()
-			if time.Since(lastActivity) > INACTIVITY_TIMEOUT {
-				log.Println("Room", id, "has been inactive for too long, deleting it")
-				s.rooms.Delete(id)
-			}
-			return true
-		})
+func (s *Server) cleanupInactiveRooms() {
+	for _, room := range s.snapshotRooms() {
+		room.post(room.sweepIfInactive)
 	}
 }
 
-func (s *Server) statsHeartbeat(errChan chan error) {
-	ticker := time.NewTicker(HEARTBEAT)
-	defer ticker.Stop()
-	defer func() {
-		if r := recover(); r != nil {
-			errChan <- fmt.Errorf("panic in statsHeartbeat: %v", r)
-		}
-	}()
+func (s *Server) heartbeat() {
+	log.Println("Clients Online & Threads Running", s.onlineCount(), runtime.NumGoroutine())
 
-	for range ticker.C {
-		s.saveStats()
+	for _, room := range s.snapshotRooms() {
+		room.post(room.heartbeatIdleClients)
 	}
 }
 
-func (s *Server) heartbeat(errChan chan error) {
-	ticker := time.NewTicker(HEARTBEAT)
-	defer ticker.Stop()
-	defer func() {
-		if r := recover(); r != nil {
-			errChan <- fmt.Errorf("panic in heartbeat: %v", r)
-		}
-	}()
-
-	for range ticker.C {
-		log.Println("Clients Online & Threads Running", s.onlineCount(), runtime.NumGoroutine())
-
-		s.onlineClients.Range(func(_, value interface{}) bool {
-			client := value.(*Client)
-			client.mu.Lock()
-			idle := time.Since(client.lastActivity) > HEARTBEAT
-			client.mu.Unlock()
-			if idle {
-				client.sendPacket(`{"type":"HEARTBEAT","quiet":true}`)
-			}
-			return true
-		})
-	}
-}
-
-func (s *Server) handleConnection(conn net.Conn, errChan chan error) {
+// handleConnection is the reader side of one connection: it parses each frame
+// into an Envelope once, then posts the work to the client's room. It touches
+// no shared state itself.
+func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	defer func() {
-		if r := recover(); r != nil {
-			errChan <- fmt.Errorf("panic in handleConnection: %v", r)
-		}
-	}()
+	defer logPanic("handleConnection")
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, INITIAL_SCAN_BUFFER), MAX_PACKET_SIZE)
 	scanner.Split(splitNullByte)
 
 	var client *Client
+	var room *Room
 
 	for scanner.Scan() {
-		packet := scanner.Text()
-
-		if !gjson.Valid(packet) {
-			log.Printf("Invalid JSON packet: %s\n", packet)
+		env, err := parseEnvelope(scanner.Text())
+		if err != nil {
+			log.Printf("Invalid JSON packet: %s\n", scanner.Text())
 			continue
 		}
-
-		packetTypeWrapped := gjson.Get(packet, "type")
-		if !packetTypeWrapped.Exists() {
+		if env.Type == "" {
 			log.Println("Packet missing type")
 			continue
 		}
 
-		packetType := packetTypeWrapped.String()
-
-		// Health check
-		if packetType == "STATS" {
-			outgoingPacket, _ := sjson.Set(`{"type":"STATS"}`, "uniqueCount", s.nextClientId.Load())
-			outgoingPacket, _ = sjson.Set(outgoingPacket, "gameCompleteCount", s.gameCompleteCount.Load())
-			outgoingPacket, _ = sjson.Set(outgoingPacket, "onlineCount", s.onlineCount())
-			conn.Write(append([]byte(outgoingPacket), 0))
+		// Health check, answered without a handshake
+		if env.Type == PacketStats {
+			writeFrame(conn, marshalPacket(statsReplyPacket{
+				Type:              PacketStats,
+				UniqueCount:       s.nextClientId.Load(),
+				GameCompleteCount: s.gameCompleteCount.Load(),
+				OnlineCount:       s.onlineCount(),
+			}))
 			continue
 		}
 
 		if client == nil {
-			if packetType != "HANDSHAKE" {
+			if env.Type != PacketHandshake {
 				log.Println("Client must handshake first")
 				continue
 			}
 
-			client = s.findOrCreateClient(packet, conn)
+			client, room = s.joinRoom(env, conn)
 			log.Printf("Client %v Connected\n", client.id)
-			client.room.broadcastAllClientState()
-			client.sendRoomState()
-		} else {
-			client.handlePacket(packet)
+			continue
 		}
+
+		room.post(func() { room.handlePacket(client, env) })
 	}
 
 	if client != nil {
-		client.disconnectConn(conn)
-		client.room.broadcastAllClientState()
+		// Single teardown path: the room decides whether this conn is still
+		// the client's current session and broadcasts if it was
+		room.post(func() { room.disconnect(client, conn) })
 
 		if err := scanner.Err(); err != nil {
 			if errors.Is(err, bufio.ErrTooLong) {
@@ -251,78 +286,53 @@ func (s *Server) handleConnection(conn net.Conn, errChan chan error) {
 	} else {
 		log.Println("Unknown client disconnected.")
 	}
-
 }
 
-func (s *Server) findOrCreateClient(packet string, conn net.Conn) *Client {
-	clientId := gjson.Get(packet, "clientId").Uint()
-	roomId := gjson.Get(packet, "roomId").String()
+// joinRoom resolves the client id, then asks the room to bind the connection.
+// The rare race where the room shuts down between lookup and post is handled
+// by taking another lap, which creates a fresh room.
+func (s *Server) joinRoom(env *Envelope, conn net.Conn) (*Client, *Room) {
+	clientId := s.resolveClientId(env.ClientID, env.RoomID)
 
-	takeover := false
-	if clientId != 0 {
-		if value, ok := s.onlineClients.Load(clientId); ok {
-			existing := value.(*Client)
-			if existing.room.id == roomId {
-				takeover = true
-				log.Printf("Client %v reconnected, closing stale session\n", clientId)
-				existing.disconnect()
-			} else {
-				clientId = 0
-			}
+	for {
+		room := s.findOrCreateRoom(env.RoomID, clientId, string(env.RoomState))
+		reply := make(chan *Client, 1)
+		if room.post(func() { reply <- room.join(clientId, env, conn) }) {
+			return <-reply, room
 		}
 	}
-
-	// Check if the client id is already in use or is 0 and look for a new one
-	for !takeover {
-		if _, ok := s.onlineClients.Load(clientId); !ok && clientId != 0 {
-			break
-		}
-		clientId = s.nextClientId.Add(1)
-	}
-
-	room := s.findOrCreateRoom(packet, clientId)
-	team := room.findOrCreateTeam(gjson.Get(packet, "clientState.teamId").String())
-
-	var client *Client
-	loadedClient, ok := room.clients.Load(clientId)
-	clientState, _ := sjson.Set(gjson.Get(packet, "clientState").Raw, "clientId", clientId)
-	if ok {
-		client = loadedClient.(*Client)
-		client.mu.Lock()
-		client.attachConnLocked(conn)
-		client.state = clientState
-		client.team = team
-		client.lastActivity = time.Now()
-		client.mu.Unlock()
-	} else {
-		client = &Client{
-			id:           clientId,
-			server:       s,
-			room:         room,
-			team:         team,
-			state:        clientState,
-			lastActivity: time.Now(),
-		}
-		client.mu.Lock()
-		client.attachConnLocked(conn)
-		client.mu.Unlock()
-		room.clients.Store(clientId, client)
-	}
-
-	s.onlineClients.Store(clientId, client)
-
-	return client
 }
 
-func (s *Server) findOrCreateRoom(packet string, clientId uint64) *Room {
-	roomId := gjson.Get(packet, "roomId").String()
+// resolveClientId decides which id a handshake gets. An id that is currently
+// online in the same room is the same player reconnecting — the room will take
+// over the stale session. An id online in a different room isn't theirs, so a
+// fresh one is minted (ids are globally unique per server).
+func (s *Server) resolveClientId(requested uint64, roomId string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	room, ok := s.rooms.Load(roomId)
-	if !ok {
-		room, _ = s.rooms.LoadOrStore(roomId, NewRoom(roomId, clientId, packet))
+	if requested != 0 {
+		room, online := s.clientRooms[requested]
+		if !online || room.id == roomId {
+			return requested
+		}
 	}
 
-	return room.(*Room)
+	for {
+		id := s.nextClientId.Add(1)
+		if _, taken := s.clientRooms[id]; !taken {
+			return id
+		}
+	}
+}
+
+// writeFrame writes one null-terminated packet to conn. It is the mirror of
+// splitNullByte on the read side.
+func writeFrame(conn net.Conn, packet string) error {
+	buf := make([]byte, len(packet)+1)
+	copy(buf, packet)
+	_, err := conn.Write(buf)
+	return err
 }
 
 func splitNullByte(data []byte, atEOF bool) (advance int, token []byte, err error) {
