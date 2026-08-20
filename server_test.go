@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -64,12 +65,21 @@ func (p *peer) handshake(room string, id uint64) {
 	p.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":%d,"roomState":{},"clientState":{"teamId":"1","isSaveLoaded":true}}`, room, id)
 }
 
+// recv reads one frame, or returns "" on timeout/EOF.
+func (p *peer) recv(d time.Duration) string {
+	p.conn.SetReadDeadline(time.Now().Add(d))
+	if !p.sc.Scan() {
+		return ""
+	}
+	return p.sc.Text()
+}
+
+// drain reads until the connection goes quiet for d. It ends on a read
+// timeout, which puts the bufio.Scanner in its terminal error state — this
+// peer cannot recv again afterwards. Use it to discard traffic you are done
+// with, never as a "skip the join packets" step before more reading.
 func (p *peer) drain(d time.Duration) {
-	for {
-		p.conn.SetReadDeadline(time.Now().Add(d))
-		if !p.sc.Scan() {
-			return
-		}
+	for p.recv(d) != "" {
 	}
 }
 
@@ -360,4 +370,131 @@ func TestRBJoinShutdownStress(t *testing.T) {
 	if stuckWrite > 0 {
 		t.Errorf("%d writeLoops parked on an orphaned channel", stuckWrite)
 	}
+}
+
+// Finding 4: only one goroutine may ever write to a connection.
+//
+// writeLoop owns the socket once a client exists. handleConnection used to
+// answer STATS with its own conn.Write from the reader goroutine, so a STATS
+// reply could land in the middle of a packet writeLoop was still sending and
+// truncate the client's frame. This asserts the routing decision directly:
+// before a handshake the reader writes, after one the reply is queued.
+func TestSrvStatsNeverWritesToALiveConn(t *testing.T) {
+	// Pre-handshake: the reader goroutine is the only writer, so it replies
+	// on the connection itself.
+	srv, cli := net.Pipe()
+	defer srv.Close()
+	defer cli.Close()
+
+	go testServer.replyStats(nil, nil, srv)
+
+	cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 512)
+	n, err := cli.Read(buf)
+	if err != nil {
+		t.Fatalf("pre-handshake STATS was not written to the conn: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), `"type":"STATS"`) {
+		t.Fatalf("unexpected pre-handshake reply: %q", buf[:n])
+	}
+	t.Log("no client yet -> written directly, as the connection's only writer")
+
+	// Post-handshake: writeLoop owns the socket. The reply must go through the
+	// send queue and must not touch the conn. net.Pipe is unbuffered, so any
+	// stray write would surface as bytes readable here.
+	srv2, cli2 := net.Pipe()
+	defer srv2.Close()
+	defer cli2.Close()
+
+	r := NewRoom(testServer, "stats-unit-room", 1, "{}")
+	go r.run()
+	defer func() { onRoom(r, r.shutdown) }()
+
+	c := &Client{id: 1, room: r, conn: srv2, sendCh: make(chan string, 4), online: true}
+	onRoom(r, func() { r.clients[1] = c })
+
+	// Run it off-goroutine: net.Pipe is synchronous, so a stray direct write
+	// would block here rather than fail, and the suite would just time out.
+	done := make(chan struct{})
+	go func() { testServer.replyStats(c, r, srv2); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replyStats blocked writing to a live conn instead of queueing")
+	}
+	onRoom(r, func() {}) // flush the posted event
+
+	cli2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := cli2.Read(buf); err == nil {
+		t.Errorf("STATS bypassed the send queue and wrote %d bytes straight to a live conn", n)
+	}
+
+	select {
+	case packet := <-c.sendCh:
+		if !strings.Contains(packet, `"type":"STATS"`) {
+			t.Fatalf("queued packet is not a STATS reply: %q", packet)
+		}
+		t.Log("client exists -> queued for writeLoop, conn untouched")
+	default:
+		t.Error("STATS reply never reached the client's send queue")
+	}
+}
+
+// End to end: a handshaked client still gets STATS answers, in-band with
+// everything else on its connection, and every frame stays valid.
+func TestSrvStatsAfterHandshakeStillAnswered(t *testing.T) {
+	const id = "stats-room"
+
+	p := dial(t)
+	defer p.close()
+	p.handshake(id, 0)
+
+	for i := 0; i < 20; i++ {
+		p.send(`{"type":"STATS"}`)
+	}
+
+	// No drain first: it would end on a timeout and kill the scanner. The join
+	// packets simply arrive ahead of the replies and are counted as frames.
+	stats, corrupt := 0, 0
+	for stats < 20 {
+		f := p.recv(3 * time.Second)
+		if f == "" {
+			break
+		}
+		if !json.Valid([]byte(f)) {
+			corrupt++
+			continue
+		}
+		if strings.Contains(f, `"type":"STATS"`) {
+			stats++
+		}
+	}
+
+	t.Logf("%d/20 STATS replies received, %d malformed frames", stats, corrupt)
+	if stats != 20 {
+		t.Errorf("expected 20 STATS replies, got %d", stats)
+	}
+	if corrupt > 0 {
+		t.Errorf("%d malformed frames", corrupt)
+	}
+}
+
+// The pre-handshake health check still works, and still needs no handshake.
+func TestSrvStatsBeforeHandshake(t *testing.T) {
+	p := dial(t)
+	defer p.close()
+	p.send(`{"type":"STATS"}`)
+
+	f := p.recv(2 * time.Second)
+	if f == "" {
+		t.Fatal("no reply to pre-handshake STATS")
+	}
+	var reply statsReplyPacket
+	if err := json.Unmarshal([]byte(f), &reply); err != nil {
+		t.Fatalf("reply is not valid JSON: %v", err)
+	}
+	if reply.Type != PacketStats {
+		t.Fatalf("expected a STATS reply, got %q", reply.Type)
+	}
+	t.Logf("pre-handshake STATS answered: onlineCount=%d uniqueCount=%d", reply.OnlineCount, reply.UniqueCount)
 }

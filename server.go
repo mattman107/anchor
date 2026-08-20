@@ -246,12 +246,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		// Health check, answered without a handshake
 		if env.Type == PacketStats {
-			writeFrame(conn, marshalPacket(statsReplyPacket{
-				Type:              PacketStats,
-				UniqueCount:       s.nextClientId.Load(),
-				GameCompleteCount: s.gameCompleteCount.Load(),
-				OnlineCount:       s.onlineCount(),
-			}))
+			s.replyStats(client, room, conn)
 			continue
 		}
 
@@ -341,8 +336,33 @@ func (s *Server) resolveClientId(requested uint64, roomId string) uint64 {
 	}
 }
 
+// replyStats answers a STATS health check.
+//
+// Before the handshake this reader goroutine is the connection's only writer,
+// so it writes the reply itself. Afterwards the client's writeLoop owns the
+// socket, and writing here too would interleave these bytes with a packet
+// writeLoop is midway through sending — the client then reads a truncated
+// frame and drops the connection. So once there is a client, the reply goes
+// through the same send queue as everything else.
+func (s *Server) replyStats(client *Client, room *Room, conn net.Conn) {
+	packet := marshalPacket(statsReplyPacket{
+		Type:              PacketStats,
+		UniqueCount:       s.nextClientId.Load(),
+		GameCompleteCount: s.gameCompleteCount.Load(),
+		OnlineCount:       s.onlineCount(),
+	})
+
+	if client == nil {
+		writeFrame(conn, packet)
+		return
+	}
+
+	room.post(func() { client.send(PacketStats, packet, true) })
+}
+
 // writeFrame writes one null-terminated packet to conn. It is the mirror of
-// splitNullByte on the read side.
+// splitNullByte on the read side. Only ever called from the goroutine that
+// owns the connection: the writeLoop, or the reader before a handshake.
 func writeFrame(conn net.Conn, packet string) error {
 	buf := make([]byte, len(packet)+1)
 	copy(buf, packet)
