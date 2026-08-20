@@ -35,6 +35,14 @@ Consequences:
   plain function call on the same goroutine.
 - Rooms are independent, so per-room serialization costs no parallelism.
 
+The one sharp edge: `post` returning true means the closure was **enqueued**,
+not that it will run. `run` exits as soon as `done` closes, and whatever is
+still queued is discarded. Anything that waits for a posted closure's result
+must select on `r.done` as well, or it waits forever — `Server.joinRoom` is
+the only such caller, and it retries against a live room. For the same reason
+`Room.join` declines (returns nil) once `closed` is set, so a join that is
+dispatched after shutdown can't strand a connection in an unreachable room.
+
 ### 2. The protocol is typed and parsed once (protocol.go)
 
 Every field the server ever reads lives in one `Envelope` struct, parsed once

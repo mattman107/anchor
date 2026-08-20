@@ -289,16 +289,31 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 // joinRoom resolves the client id, then asks the room to bind the connection.
-// The rare race where the room shuts down between lookup and post is handled
-// by taking another lap, which creates a fresh room.
+//
+// A room can shut down at any point in here — between the lookup and the post,
+// or after the post while the join is still queued. post() reporting success
+// only means the closure was enqueued, and a queued closure is discarded when
+// the room's event loop exits, so waiting on the reply alone would block this
+// connection forever. Waiting on r.done as well turns every one of those cases
+// into another lap, which finds or creates a live room.
 func (s *Server) joinRoom(env *Envelope, conn net.Conn) (*Client, *Room) {
 	clientId := s.resolveClientId(env.ClientID, env.RoomID)
 
 	for {
 		room := s.findOrCreateRoom(env.RoomID, clientId, string(env.RoomState))
 		reply := make(chan *Client, 1)
-		if room.post(func() { reply <- room.join(clientId, env, conn) }) {
-			return <-reply, room
+		if !room.post(func() { reply <- room.join(clientId, env, conn) }) {
+			continue
+		}
+
+		select {
+		case client := <-reply:
+			// nil means the join ran but the room had already closed
+			if client != nil {
+				return client, room
+			}
+		case <-room.done:
+			// the join never ran, or ran and declined
 		}
 	}
 }

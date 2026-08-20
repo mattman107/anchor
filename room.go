@@ -30,6 +30,8 @@ type Room struct {
 	state   string // room settings blob (opaque, relayed)
 	clients map[uint64]*Client
 	teams   map[string]*Team
+	created time.Time // when the room was registered, for the inactivity sweep
+	closed  bool      // shutdown has run; joins must be declined, not honored
 }
 
 // Team state is plain data owned by the room goroutine.
@@ -75,6 +77,7 @@ func NewRoom(server *Server, id string, ownerClientId uint64, roomState string) 
 		state:   state,
 		clients: map[uint64]*Client{},
 		teams:   map[string]*Team{},
+		created: time.Now(),
 	}
 }
 
@@ -96,8 +99,10 @@ func (r *Room) dispatch(fn func()) {
 	fn()
 }
 
-// post schedules fn on the room goroutine. Returns false if the room has shut
-// down, in which case fn never runs.
+// post schedules fn on the room goroutine. A false return means the room was
+// already shut down. A true return only means fn was ENQUEUED: if the room
+// shuts down first, run() exits and the queued fn is discarded. Callers that
+// wait for a result must therefore also watch r.done — see Server.joinRoom.
 func (r *Room) post(fn func()) bool {
 	select {
 	case r.events <- fn:
@@ -121,6 +126,13 @@ func (r *Room) findOrCreateTeam(teamId string) *Team {
 // connection. A reconnect is a takeover: the stale session's writer is closed
 // and the new connection replaces it.
 func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
+	// The room can be shut down between this event being queued and run().
+	// Binding the connection here would strand it in a room nothing can reach,
+	// so decline and let the caller retry against a live room.
+	if r.closed {
+		return nil
+	}
+
 	fields := parseClientStateFields(env.ClientState)
 	state, _ := sjson.Set(string(env.ClientState), "clientId", clientId)
 
@@ -328,7 +340,9 @@ func (r *Room) broadcastAllClientState() {
 // INACTIVITY_TIMEOUT. Connected clients are heartbeated every HEARTBEAT, which
 // counts as activity, so only rooms with no live connections expire.
 func (r *Room) sweepIfInactive() {
-	var last time.Time
+	// Seeded with creation time so a room that exists but has not finished its
+	// first join yet isn't swept the instant it appears
+	last := r.created
 	for _, c := range r.clients {
 		if c.lastActivity.After(last) {
 			last = c.lastActivity
@@ -354,6 +368,11 @@ func (r *Room) heartbeatIdleClients() {
 // shutdown detaches everyone still connected, unregisters the room, and stops
 // the event loop. Runs on the room goroutine; posts after this return false.
 func (r *Room) shutdown() {
+	if r.closed {
+		return
+	}
+	r.closed = true
+
 	for _, c := range r.clients {
 		if c.conn != nil {
 			r.server.clearClientRoom(c.id, r)
