@@ -105,7 +105,10 @@ func (s *Server) runPeriodic(name string, fn func()) {
 }
 
 // Registry helpers. These take mu briefly and never call into a room while
-// holding it.
+// holding it. Every one of them releases mu with defer: a panic anywhere under
+// this lock would otherwise leave it held, and since panics on the room and
+// console goroutines are recovered rather than fatal, the process would keep
+// running with every registry operation deadlocked behind it.
 
 func (s *Server) findOrCreateRoom(roomId string, ownerClientId uint64, roomState string) *Room {
 	s.mu.Lock()
@@ -123,10 +126,27 @@ func (s *Server) findOrCreateRoom(roomId string, ownerClientId uint64, roomState
 
 func (s *Server) removeRoom(roomId string, room *Room) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.rooms[roomId] == room {
 		delete(s.rooms, roomId)
 	}
-	s.mu.Unlock()
+}
+
+// lookupRoom returns the room registered under roomId, or nil.
+func (s *Server) lookupRoom(roomId string) *Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.rooms[roomId]
+}
+
+// roomOfClient returns the room an online client is in, or nil.
+func (s *Server) roomOfClient(clientId uint64) *Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.clientRooms[clientId]
 }
 
 func (s *Server) snapshotRooms() []*Room {
@@ -143,16 +163,18 @@ func (s *Server) snapshotRooms() []*Room {
 
 func (s *Server) setClientRoom(clientId uint64, room *Room) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.clientRooms[clientId] = room
-	s.mu.Unlock()
 }
 
 func (s *Server) clearClientRoom(clientId uint64, room *Room) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.clientRooms[clientId] == room {
 		delete(s.clientRooms, clientId)
 	}
-	s.mu.Unlock()
 }
 
 func (s *Server) onlineCount() int {

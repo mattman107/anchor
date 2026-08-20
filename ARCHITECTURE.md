@@ -60,7 +60,12 @@ the complete list of packets the server originates.
   connection actually belongs to, not the `clientId` written in the packet, so
   a client can't spoof another's identity.
 - **Per-event panic isolation.** A panic in one packet handler kills that event,
-  not the room (and not the server).
+  not the room (and not the server). The console dispatches each command the
+  same way. This only works if no lock can be left held: because a recovered
+  panic keeps the process alive, a non-deferred `Unlock` would wedge every
+  future registry operation instead of crashing. Every `s.mu.Lock` releases
+  with `defer`, and console commands validate their arguments rather than
+  relying on the recover.
 
 ## What stayed the same on purpose
 

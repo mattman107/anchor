@@ -498,3 +498,69 @@ func TestSrvStatsBeforeHandshake(t *testing.T) {
 	}
 	t.Logf("pre-handshake STATS answered: onlineCount=%d uniqueCount=%d", reply.OnlineCount, reply.UniqueCount)
 }
+
+// Finding 6: console.go indexed args[1] for disable/message/deleteRoom with no
+// bounds check, on a goroutine with no recover. Typing "disable" with no id
+// panicked processStdin and took the whole server, and every session, down.
+func TestSrvConsoleNeverPanics(t *testing.T) {
+	lines := []string{
+		// the three that used to panic, and their trailing-space variants
+		"disable", "message", "deleteRoom",
+		"disable ", "message ", "deleteRoom ",
+		// arguments that parse but resolve to nothing
+		"disable notanumber", "message 0", "message 999999 hi", "deleteRoom nope",
+		// everything else, including empty and unknown input
+		"disableAll", "messageAll", "roomCount", "clientCount", "stats", "list",
+		"help", "", "   ", "quiet", "quiet",
+	}
+
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	for _, line := range lines {
+		testServer.runConsoleCommand(strings.Split(line, " "))
+	}
+	log.SetOutput(os.Stderr)
+
+	if strings.Contains(logs.String(), "Panic in") {
+		for _, l := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(l, "Panic in") {
+				t.Error(l)
+			}
+		}
+	}
+
+	// The server must still be serving after all of that.
+	p := dial(t)
+	defer p.close()
+	p.send(`{"type":"STATS"}`)
+	if p.recv(2*time.Second) == "" {
+		t.Fatal("server stopped answering after console input")
+	}
+	t.Logf("%d console lines run, server still serving", len(lines))
+}
+
+// A well-formed command still does its job.
+func TestSrvConsoleDeleteRoomStillWorks(t *testing.T) {
+	const id = "console-room"
+	p := dial(t)
+	defer p.close()
+	p.handshake(id, 0)
+	p.recv(time.Second)
+
+	r := room(t, id)
+	testServer.runConsoleCommand([]string{"deleteRoom", id})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		testServer.mu.Lock()
+		_, still := testServer.rooms[id]
+		testServer.mu.Unlock()
+		if !still {
+			t.Log("deleteRoom unregistered the room")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = r
+	t.Error("deleteRoom did not remove the room")
+}
