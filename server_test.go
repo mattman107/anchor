@@ -664,3 +664,151 @@ func BenchmarkBroadcastAllClientState(b *testing.B) {
 		})
 	}
 }
+
+// fakeConn stands in for a live connection in tests that never write to one.
+type fakeConn struct{ net.Conn }
+
+func (fakeConn) Close() error                       { return nil }
+func (fakeConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func teamID(s string) *string { return &s }
+
+// A queue-full teardown happens inside the snapshot send, and that teardown
+// broadcasts again. Those must not nest once per dropped client.
+func TestSrvBroadcastDoesNotNestPerDrop(t *testing.T) {
+	for _, n := range []int{8, 16, 32} {
+		r := NewRoom(testServer, "nest-"+strconv.Itoa(n), 1, "{}")
+		state := `{"clientId":0,"pad":"` + strings.Repeat("x", 4*1024) + `"}`
+		for i := 1; i <= n; i++ {
+			// unbuffered: every send takes the "queue full" branch
+			r.clients[uint64(i)] = &Client{
+				id: uint64(i), room: r, state: state,
+				sendCh: make(chan string), conn: fakeConn{}, online: true,
+			}
+		}
+
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		r.broadcastAllClientState()
+		runtime.ReadMemStats(&after)
+		kb := (after.TotalAlloc - before.TotalAlloc) / 1024
+
+		// At most two passes, each sending n packets of n states. Allow 3x for
+		// builder growth and the per-member sjson.Set. The nesting version blew
+		// through this by an order of magnitude (~170 MB at n=32).
+		budget := uint64(3*2*n*n*len(state)) / 1024
+		t.Logf("N=%-3d every queue full -> %5d KB for one broadcast (budget %d KB)", n, kb, budget)
+		if kb > budget {
+			t.Errorf("N=%d allocated %d KB, expected under %d KB — broadcasts are still nesting", n, kb, budget)
+		}
+		for _, c := range r.clients {
+			if c.online {
+				t.Errorf("client %d should have been dropped", c.id)
+			}
+		}
+	}
+}
+
+// The replay queue must be bounded in bytes, not just in packet count.
+func TestSrvTeamQueueBoundedInBytes(t *testing.T) {
+	r := NewRoom(testServer, "bytes-room", 1, "{}")
+	team := r.findOrCreateTeam("t")
+
+	packet := `{"type":"J","pad":"` + strings.Repeat("z", 256*1024) + `"}`
+	for i := 0; i < MAX_TEAM_QUEUE*2; i++ {
+		team.enqueue(packet)
+	}
+
+	actual := 0
+	for _, q := range team.queue {
+		actual += len(q)
+	}
+	t.Logf("%d packets of %d KB enqueued -> %d retained, %d MB (bound %d MB), %d dropped",
+		MAX_TEAM_QUEUE*2, len(packet)/1024, len(team.queue), actual/(1<<20),
+		MAX_TEAM_QUEUE_BYTES/(1<<20), team.droppedFromQueue)
+
+	if actual > MAX_TEAM_QUEUE_BYTES {
+		t.Errorf("queue holds %d bytes, over the %d byte bound", actual, MAX_TEAM_QUEUE_BYTES)
+	}
+	if team.queueBytes != actual {
+		t.Errorf("queueBytes = %d, actual = %d — accounting drifted", team.queueBytes, actual)
+	}
+	if len(team.queue) > MAX_TEAM_QUEUE {
+		t.Errorf("queue holds %d packets, over the %d packet bound", len(team.queue), MAX_TEAM_QUEUE)
+	}
+	if team.droppedFromQueue == 0 {
+		t.Error("expected oldest packets to be dropped")
+	}
+}
+
+// A single packet larger than the byte bound is still kept, not dropped into
+// an empty queue, and does not break the accounting.
+func TestSrvTeamQueueKeepsOversizePacket(t *testing.T) {
+	team := &Team{id: "t", state: "{}"}
+	big := strings.Repeat("q", MAX_TEAM_QUEUE_BYTES+1024)
+	team.enqueue(big)
+	if len(team.queue) != 1 || team.queueBytes != len(big) {
+		t.Fatalf("oversize packet: queue=%d bytes=%d", len(team.queue), team.queueBytes)
+	}
+	team.enqueue("small")
+	if team.queueBytes != len("small") || len(team.queue) != 1 {
+		t.Fatalf("after a small packet: queue=%d bytes=%d, want the oversize one evicted",
+			len(team.queue), team.queueBytes)
+	}
+	t.Log("oversize packet retained, then evicted by the next enqueue")
+}
+
+// Building the REQUEST_TEAM_STATE reply must not allocate a giant string only
+// to discover it is over the limit.
+func TestSrvTeamReplyDoesNotOverAllocate(t *testing.T) {
+	r := NewRoom(testServer, "reply-room", 1, "{}")
+	team := r.findOrCreateTeam("t")
+	packet := `{"type":"J","pad":"` + strings.Repeat("y", 64*1024) + `"}`
+	for i := 0; i < MAX_TEAM_QUEUE; i++ {
+		team.enqueue(packet)
+	}
+
+	c := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 4)}
+	r.clients[1] = c
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	r.handleRequestTeamState(c, &Envelope{Type: PacketRequestTeamState, TargetTeamID: teamID("t")})
+	runtime.ReadMemStats(&after)
+
+	alloc := after.TotalAlloc - before.TotalAlloc
+	sent := <-c.sendCh
+	t.Logf("queue %d MB raw -> reply built with %d MB allocated, %d bytes sent",
+		team.queueBytes/(1<<20), alloc/(1<<20), len(sent))
+
+	if len(sent) > MAX_PACKET_SIZE {
+		t.Errorf("sent %d bytes, over the %d byte limit", len(sent), MAX_PACKET_SIZE)
+	}
+	// Bounded queue means a bounded reply; allocation should stay within a
+	// small multiple of MAX_PACKET_SIZE rather than tracking the raw queue.
+	if alloc > 4*MAX_PACKET_SIZE {
+		t.Errorf("allocated %d MB building one reply", alloc/(1<<20))
+	}
+}
+
+// Repeating REQUEST_TEAM_STATE must not grow requestingState without bound.
+func TestSrvRequestingStateDeduped(t *testing.T) {
+	r := NewRoom(testServer, "req-room", 1, "{}")
+	team := r.findOrCreateTeam("t")
+
+	asker := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 8192), team: team}
+	mate := &Client{id: 2, room: r, state: `{"clientId":2}`, sendCh: make(chan string, 8192),
+		team: team, saveLoaded: true, conn: fakeConn{}}
+	r.clients[1], r.clients[2] = asker, mate
+
+	for i := 0; i < 5000; i++ {
+		r.handleRequestTeamState(asker, &Envelope{Type: PacketRequestTeamState, TargetTeamID: teamID("t")})
+	}
+
+	t.Logf("5000 identical requests -> %d entries in requestingState", len(team.requestingState))
+	if len(team.requestingState) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(team.requestingState))
+	}
+}

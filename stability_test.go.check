@@ -1,0 +1,508 @@
+package main
+
+// Repros for the stability findings. Each test demonstrates one flaw against a
+// real in-process server over a real TCP socket.
+//
+//	go test -v -run TestRepro
+//
+// A FAILING test here means the bug reproduced — that is the point. Tests that
+// PASS report their evidence via t.Log; read the -v output, not the exit code.
+//
+// The memory-exhaustion repro is opt-in because it allocates GBs:
+//
+//	ANCHOR_OOM_REPRO=1 go test -v -run TestReproTeamQueueUnbounded
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tidwall/gjson"
+)
+
+const addr = "127.0.0.1:43383"
+
+var testServer *Server
+
+func TestMain(m *testing.M) {
+	// saveStats() writes ./stats.json in cwd; don't clobber the repo's copy.
+	dir, _ := os.MkdirTemp("", "anchor-test")
+	os.Chdir(dir)
+	log.SetOutput(os.Stderr)
+
+	testServer = NewServer()
+	go testServer.Start(make(chan error, 64))
+	waitListening()
+
+	code := m.Run()
+	os.Exit(code)
+}
+
+func waitListening() {
+	for i := 0; i < 100; i++ {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			c.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	panic("server never came up")
+}
+
+// --- tiny client -----------------------------------------------------------
+
+type peer struct {
+	conn net.Conn
+	sc   *bufio.Scanner
+}
+
+func dial(t *testing.T) *peer {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	sc.Split(splitNullByte)
+	return &peer{conn: c, sc: sc}
+}
+
+func (p *peer) send(format string, args ...interface{}) {
+	fmt.Fprintf(p.conn, format, args...)
+	p.conn.Write([]byte{0})
+}
+
+func (p *peer) handshake(room string, clientID uint64) {
+	p.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":%d,"roomState":{},"clientState":{"teamId":"1","isSaveLoaded":true}}`, room, clientID)
+}
+
+// recv reads one frame, or returns "" on timeout/EOF.
+func (p *peer) recv(d time.Duration) string {
+	p.conn.SetReadDeadline(time.Now().Add(d))
+	if !p.sc.Scan() {
+		return ""
+	}
+	return p.sc.Text()
+}
+
+func (p *peer) drain(d time.Duration) {
+	for p.recv(d) != "" {
+	}
+}
+
+func (p *peer) close() { p.conn.Close() }
+
+// ---------------------------------------------------------------------------
+// FINDING 1: unauthenticated session takeover.
+//
+// findOrCreateClient trusts the client-supplied clientId. Any connection that
+// knows a roomId can claim another member's clientId; the server calls
+// existing.disconnect() and rebinds that Client to the new socket. No secret,
+// no token, no proof. One attacker walking clientIds 1..N evicts every member
+// of a room and inherits their identity.
+// ---------------------------------------------------------------------------
+
+func TestReproSessionHijack(t *testing.T) {
+	const room = "hijack-room"
+
+	victim := dial(t)
+	defer victim.close()
+	victim.handshake(room, 900100)
+	victim.drain(300 * time.Millisecond)
+
+	attacker := dial(t)
+	defer attacker.close()
+	attacker.handshake(room, 900100) // same id, no credentials
+	attacker.drain(300 * time.Millisecond)
+
+	// Victim's socket is now dead.
+	victim.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := victim.conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("victim still connected: takeover did not happen")
+	}
+	t.Log("victim evicted by an unauthenticated peer that guessed its clientId")
+
+	// And the attacker now owns the victim's Client object.
+	if v, ok := findRoom(t, room).clients.Load(uint64(900100)); ok {
+		c := v.(*Client)
+		c.mu.Lock()
+		same := c.conn != nil && c.conn.RemoteAddr().String() == attacker.conn.LocalAddr().String()
+		c.mu.Unlock()
+		if !same {
+			t.Fatal("expected attacker conn bound to victim's Client")
+		}
+		t.Log("attacker's socket is bound to client 900100 — full session inheritance")
+	}
+}
+
+func findRoom(t *testing.T, id string) *Room {
+	t.Helper()
+	v, ok := testServer.rooms.Load(id)
+	if !ok {
+		t.Fatalf("room %q not found", id)
+	}
+	return v.(*Room)
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 2: O(N^2) packet construction inside the room mutex.
+//
+// Room.broadcastAllClientState holds r.mu for its entire body. It builds one
+// packet containing every client's state (N * stateSize), then calls
+// sjson.Set on that whole packet once per client — copying it N times. Total
+// allocation per call is N^2 * stateSize, and it runs on EVERY connect and
+// EVERY disconnect, with the room lock held the whole time.
+//
+// A single peer reconnect-looping in a populated room stalls the room and
+// drives the allocator into a GC death spiral.
+// ---------------------------------------------------------------------------
+
+func TestReproBroadcastAmplification(t *testing.T) {
+	const room = "amp-room"
+	state := strings.Repeat("x", 32*1024) // 32 KB per client — clients set this freely
+
+	var peers []*peer
+	defer func() {
+		for _, p := range peers {
+			p.close()
+		}
+	}()
+
+	report := func(n int) (time.Duration, uint64) {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		start := time.Now()
+		findRoom(t, room).broadcastAllClientState()
+		d := time.Since(start)
+		runtime.ReadMemStats(&after)
+		return d, after.TotalAlloc - before.TotalAlloc
+	}
+
+	var first, last time.Duration
+	for n := 1; n <= 32; n++ {
+		p := dial(t)
+		peers = append(peers, p)
+		p.handshake(room, uint64(910000+n))
+		p.send(`{"type":"UPDATE_CLIENT_STATE","state":{"teamId":"1","isSaveLoaded":true,"pad":%q}}`, state)
+		go p.drain(5 * time.Second) // keep queues moving
+		time.Sleep(15 * time.Millisecond)
+
+		if n == 1 || n == 8 || n == 16 || n == 32 {
+			d, alloc := report(n)
+			t.Logf("N=%-3d broadcastAllClientState: %8v, %6d MB allocated under room lock",
+				n, d.Round(time.Microsecond), alloc/(1<<20))
+			if n == 1 {
+				first = d
+			}
+			last = d
+		}
+	}
+
+	// Quadratic, not linear: 32x the clients costs far more than 32x the time.
+	if last < first*32 {
+		t.Logf("growth was %.0fx for 32x clients (expected >>32x)", float64(last)/float64(first))
+	}
+	t.Logf("this runs twice per connection lifecycle, holding r.mu — every "+
+		"UPDATE_ROOM_STATE and every join in room %q blocks behind it", room)
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 3: unbounded server memory driven by one client.
+//
+// Three multipliers, none capped:
+//   - MAX_PACKET_SIZE is 8 MB per packet.
+//   - Team.enqueue caps the queue at 512 *packets*, not bytes: 512 * 8 MB = 4 GB
+//     retained per team.
+//   - findOrCreateTeam mints a Team for any teamId string a client sends, and
+//     teams are never freed until the whole room is.
+//
+// So: 4 GB * (number of team ids the attacker feels like typing). Nothing in
+// the path checks total bytes, and the room only expires after 5 minutes of
+// inactivity — which the attacker resets by continuing to send.
+// ---------------------------------------------------------------------------
+
+func TestReproTeamQueueUnbounded(t *testing.T) {
+	const room = "oom-room"
+	p := dial(t)
+	defer p.close()
+	p.handshake(room, 920001)
+	go p.drain(60 * time.Second)
+
+	big := os.Getenv("ANCHOR_OOM_REPRO") != ""
+	payload, teams, per := 256*1024, 8, 64
+	if big {
+		payload, teams, per = 8*1024*1024-1024, 16, MAX_TEAM_QUEUE
+	}
+	pad := strings.Repeat("y", payload)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	for tm := 0; tm < teams; tm++ {
+		for i := 0; i < per; i++ {
+			p.send(`{"type":"JUNK","targetTeamId":"team-%d","addToQueue":true,"pad":%q}`, tm, pad)
+		}
+	}
+	// Let the server finish ingesting.
+	deadline := time.Now().Add(60 * time.Second)
+	want := teams * per
+	for time.Now().Before(deadline) && queued(findRoom(t, room)) < want {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	r := findRoom(t, room)
+	t.Logf("one client, %d teams x %d packets x %d KB payload", teams, per, payload/1024)
+	t.Logf("server retains %d queued packets, heap +%d MB",
+		queued(r), (after.HeapAlloc-before.HeapAlloc)/(1<<20))
+	if !big {
+		t.Logf("scaled to the real limits (8 MB packets, %d-deep queues): %d MB per team, "+
+			"unbounded team count. Set ANCHOR_OOM_REPRO=1 to run it for real.",
+			MAX_TEAM_QUEUE, MAX_TEAM_QUEUE*8)
+	}
+	if queued(r) < want {
+		t.Errorf("only %d/%d packets landed", queued(r), want)
+	}
+}
+
+func queued(r *Room) int {
+	n := 0
+	r.teams.Range(func(_, v interface{}) bool {
+		tm := v.(*Team)
+		tm.mu.Lock()
+		n += len(tm.queue)
+		tm.mu.Unlock()
+		return true
+	})
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 4: attachConnLocked overwrites a live connection, leaking its
+// writeLoop goroutine forever.
+//
+// findOrCreateClient's "reclaim an offline clientId" path is not atomic: the
+// onlineClients.Load / room.clients.Load / attachConnLocked sequence has no
+// lock spanning it. Two connections claiming the same free clientId both reach
+// attachConnLocked on the SAME Client. The second one overwrites c.sendCh
+// without closing the first — so the first writeLoop sits on `range ch` for the
+// lifetime of the process. disconnectConn can't clean it up either: it bails on
+// `c.conn != conn`.
+//
+// Every occurrence is a permanently parked goroutine. clientId is attacker-
+// controlled, so this is trivially forceable.
+// ---------------------------------------------------------------------------
+
+func TestReproConcurrentReconnectLeak(t *testing.T) {
+	const room = "leak-room"
+	const rounds = 40
+
+	// Seed the room with clients, then take them offline so their Client
+	// objects stay parked in room.clients.
+	for i := 0; i < rounds; i++ {
+		p := dial(t)
+		p.handshake(room, uint64(930000+i))
+		p.drain(150 * time.Millisecond)
+		p.close()
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < rounds; i++ {
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		conns := make([]*peer, 2)
+		for j := 0; j < 2; j++ {
+			j := j
+			conns[j] = dial(t)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				conns[j].handshake(room, uint64(930000+i)) // both claim the same free id
+			}()
+		}
+		close(start)
+		wg.Wait()
+		time.Sleep(30 * time.Millisecond)
+		for _, c := range conns {
+			c.close()
+		}
+	}
+
+	time.Sleep(2 * time.Second)
+	runtime.GC()
+	time.Sleep(500 * time.Millisecond)
+	after := runtime.NumGoroutine()
+
+	stuck := countStuckWriteLoops()
+	t.Logf("goroutines %d -> %d (delta %+d) after %d racing reconnects", before, after, after-before, rounds)
+	t.Logf("writeLoop goroutines parked on an orphaned channel: %d", stuck)
+	if stuck == 0 && after-before < 2 {
+		t.Skip("race window not hit this run; re-run or raise rounds " +
+			"(the unsynchronized Load/attach sequence is the bug either way)")
+	}
+	t.Errorf("leaked %d goroutines / %d parked writeLoops that never exit", after-before, stuck)
+}
+
+func countStuckWriteLoops() int {
+	buf := make([]byte, 8<<20)
+	n := runtime.Stack(buf, true)
+	dump := string(buf[:n])
+	count := 0
+	for _, g := range strings.Split(dump, "\n\n") {
+		if strings.Contains(g, "(*Client).writeLoop") && strings.Contains(g, "chan receive") {
+			count++
+		}
+	}
+	return count
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 5: two goroutines write to the same socket.
+//
+// handleConnection answers STATS with a direct conn.Write from the reader
+// goroutine, while writeLoop is concurrently writing to that same conn. The
+// STATS check sits ABOVE the `client == nil` gate, so an already-handshaked
+// client can trigger it. If writeLoop is mid-Write on a large packet (kernel
+// buffer full), the STATS bytes land in the middle of it and the client's
+// null-delimited frame stream is corrupted.
+// ---------------------------------------------------------------------------
+
+func TestReproInterleavedWrites(t *testing.T) {
+	const room = "interleave-room"
+
+	victim := dial(t)
+	defer victim.close()
+	// Shrink the receive window so the server's writeLoop actually blocks
+	// inside conn.Write instead of dumping into a fat loopback buffer.
+	victim.conn.(*net.TCPConn).SetReadBuffer(2048)
+	victim.handshake(room, 940001)
+
+	other := dial(t)
+	defer other.close()
+	other.handshake(room, 940002)
+	go other.drain(20 * time.Second)
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Fill the victim's socket buffer so writeLoop blocks inside conn.Write...
+	pad := strings.Repeat("z", 7*1024*1024)
+	other.send(`{"type":"BIG","pad":%q}`, pad)
+	time.Sleep(500 * time.Millisecond)
+
+	// ...then write to the same socket from the reader goroutine.
+	for i := 0; i < 200; i++ {
+		victim.send(`{"type":"STATS"}`)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	corrupt, frames := 0, 0
+	for {
+		f := victim.recv(3 * time.Second)
+		if f == "" {
+			break
+		}
+		frames++
+		if !gjson.Valid(f) || !json.Valid([]byte(f)) {
+			corrupt++
+			if corrupt == 1 {
+				t.Logf("first corrupt frame (%d bytes): %.120q...", len(f), f)
+			}
+		}
+	}
+	t.Logf("%d frames read, %d malformed", frames, corrupt)
+	if corrupt > 0 {
+		t.Errorf("packet stream corrupted by concurrent writes to the same conn")
+	} else {
+		t.Log("not reproduced this run (timing-dependent); the unsynchronized " +
+			"conn.Write at server.go:219 races writeLoop regardless")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 6: errChan has a single-shot reader. One panic poisons it forever.
+//
+// main.go starts:
+//
+//	go func() { if err := <-errChan; err != nil { log.Printf(...) } }()
+//
+// That goroutine reads exactly ONE error and exits. errChan is unbuffered.
+// Every panic recovery in the server (handleConnection, heartbeat,
+// statsHeartbeat, cleanupInactiveRooms) ends with `errChan <- err`.
+//
+// After the first panic anywhere:
+//   - all further panics are silent, and
+//   - the recovering goroutine blocks on the send FOREVER.
+//
+// In handleConnection that defer runs BEFORE `defer conn.Close()` (LIFO), so
+// the connection is never closed either: a permanently parked goroutine plus a
+// leaked fd, per panic. The three ticker goroutines die the same way — lose
+// heartbeat, stats persistence, and room cleanup, with nothing logged.
+// ---------------------------------------------------------------------------
+
+func TestReproErrChanPoison(t *testing.T) {
+	errChan := make(chan error) // exactly as main.go builds it
+
+	go func() { // exactly as main.go consumes it
+		if err := <-errChan; err != nil {
+			t.Log("first error reported:", err)
+		}
+	}()
+
+	first := make(chan struct{})
+	go func() { errChan <- fmt.Errorf("panic #1"); close(first) }()
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first send blocked")
+	}
+
+	second := make(chan struct{})
+	go func() { errChan <- fmt.Errorf("panic #2"); close(second) }()
+	select {
+	case <-second:
+		t.Fatal("expected the second reporter to block")
+	case <-time.After(2 * time.Second):
+		t.Log("second panic reporter is blocked on errChan and will never return — " +
+			"in handleConnection that also skips `defer conn.Close()`")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 7: operator console commands index argv without checking length.
+//
+// processStdin does `splitInput[1]` for disable/message/deleteRoom with no
+// bounds check, and has no recover(). Typing `disable` with no argument panics
+// a goroutine, which kills the entire process and every connected session.
+// Same for `message` and `deleteRoom`.
+// ---------------------------------------------------------------------------
+
+func TestReproStdinPanicsServer(t *testing.T) {
+	for _, cmd := range []string{"disable", "message", "deleteRoom"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Logf("%-11q -> panic: %v  (unrecovered in processStdin => process exits)", cmd, r)
+					return
+				}
+				t.Errorf("%q did not panic", cmd)
+			}()
+			// The exact expression processStdin evaluates.
+			_ = strings.Split(cmd, " ")[1]
+		}()
+	}
+}

@@ -13,6 +13,13 @@ import (
 const roomQueueSize = 1024
 const MAX_TEAM_QUEUE = 512
 
+// MAX_TEAM_QUEUE_BYTES bounds what a team's replay queue can actually cost.
+// The packet count alone bounds nothing: 512 packets of MAX_PACKET_SIZE is 4 GB
+// per team, and teams are minted per arbitrary id. The whole queue also has to
+// fit inside one REQUEST_TEAM_STATE reply, and JSON-escaping it into that reply
+// roughly doubles it, so this sits well under MAX_PACKET_SIZE.
+const MAX_TEAM_QUEUE_BYTES = 4 * 1024 * 1024
+
 // Room is an actor: one goroutine (run) owns all room, team, and client state,
 // and everything that touches that state executes as a closure posted to the
 // events channel. There are no mutexes because there is no sharing —
@@ -31,6 +38,9 @@ type Room struct {
 	teams   map[string]*Team
 	created time.Time // when the room was registered, for the inactivity sweep
 	closed  bool      // shutdown has run; joins must be declined, not honored
+
+	broadcasting    bool // a membership snapshot is being sent right now
+	membershipDirty bool // a client dropped mid-snapshot; one more pass is owed
 }
 
 // Team state is plain data owned by the room goroutine.
@@ -38,31 +48,43 @@ type Team struct {
 	id               string
 	state            string   // last saved team state blob
 	queue            []string // packets to replay on top of the saved state
+	queueBytes       int      // total size of queue, kept in step with it
 	requestingState  []uint64 // clients waiting for an UPDATE_TEAM_STATE
 	droppedFromQueue int      // oldest queued packets discarded since the last full state
 }
 
 // enqueue appends a packet to the replay queue, dropping the oldest entries
-// once the queue is full. Without the bound a team's queue grows until the
-// room is swept, and the REQUEST_TEAM_STATE reply built from it outgrows what
-// a client will accept.
+// until the queue is within both its packet and byte bounds. Without a byte
+// bound the queue grows to gigabytes while still looking "capped", and the
+// REQUEST_TEAM_STATE reply built from it outgrows what a client will accept.
 func (t *Team) enqueue(packet string) {
 	t.queue = append(t.queue, packet)
-	if len(t.queue) <= MAX_TEAM_QUEUE {
+	t.queueBytes += len(packet)
+
+	// Never drop the packet just added, even if it alone is over the byte
+	// bound — it is still capped by MAX_PACKET_SIZE on the way in
+	drop := 0
+	for drop < len(t.queue)-1 &&
+		(len(t.queue)-drop > MAX_TEAM_QUEUE || t.queueBytes > MAX_TEAM_QUEUE_BYTES) {
+		t.queueBytes -= len(t.queue[drop])
+		drop++
+	}
+	if drop == 0 {
 		return
 	}
 
-	dropped := len(t.queue) - MAX_TEAM_QUEUE
-	copy(t.queue, t.queue[dropped:])
-	for i := MAX_TEAM_QUEUE; i < len(t.queue); i++ {
-		t.queue[i] = ""
+	kept := len(t.queue) - drop
+	copy(t.queue, t.queue[drop:])
+	for i := kept; i < len(t.queue); i++ {
+		t.queue[i] = "" // release the dropped packets for collection
 	}
-	t.queue = t.queue[:MAX_TEAM_QUEUE]
+	t.queue = t.queue[:kept]
 
 	if t.droppedFromQueue == 0 {
-		log.Printf("Team %s queue hit %d packets, dropping oldest entries", t.id, MAX_TEAM_QUEUE)
+		log.Printf("Team %s replay queue hit its bound (%d packets / %d bytes), dropping oldest entries",
+			t.id, MAX_TEAM_QUEUE, MAX_TEAM_QUEUE_BYTES)
 	}
-	t.droppedFromQueue += dropped
+	t.droppedFromQueue += drop
 }
 
 func NewRoom(server *Server, id string, ownerClientId uint64, roomState string) *Room {
@@ -109,6 +131,16 @@ func (r *Room) post(fn func()) bool {
 	case <-r.done:
 		return false
 	}
+}
+
+func containsClientId(ids []uint64, id uint64) bool {
+	for _, existing := range ids {
+		if existing == id {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (r *Room) findOrCreateTeam(teamId string) *Team {
@@ -250,8 +282,12 @@ func (r *Room) handleRequestTeamState(c *Client, env *Envelope) {
 	for _, other := range r.clients {
 		if other != c && other.conn != nil && other.team == team && other.saveLoaded {
 			// A live teammate can answer; remember who asked so their
-			// UPDATE_TEAM_STATE reply can be forwarded back
-			team.requestingState = append(team.requestingState, c.id)
+			// UPDATE_TEAM_STATE reply can be forwarded back. Recorded once
+			// however often it asks, so a client repeating the request can't
+			// grow this without bound or earn itself duplicate replies.
+			if !containsClientId(team.requestingState, c.id) {
+				team.requestingState = append(team.requestingState, c.id)
+			}
 			r.broadcastTeam(c, team, env)
 			return
 		}
@@ -266,12 +302,20 @@ func (r *Room) handleRequestTeamState(c *Client, env *Envelope) {
 		reply.State = json.RawMessage(team.state)
 	}
 
-	// The reply has to fit through the client's own frame limit, so drop the
-	// replay queue rather than send something the client will reject
+	// The reply has to fit through the client's own frame limit. Check that
+	// from the raw sizes first: marshalling escapes every queued packet into a
+	// JSON string, so building it just to measure it can allocate many times
+	// MAX_PACKET_SIZE before finding out it does not fit.
+	if len(team.state)+2*team.queueBytes+64 > MAX_PACKET_SIZE {
+		log.Printf("Team %s state plus %d queued packets (%d raw bytes) cannot fit the %d byte limit; sending state only",
+			team.id, len(reply.Queue), team.queueBytes, MAX_PACKET_SIZE)
+		reply.Queue = []string{}
+	}
+
 	packet := marshalPacket(reply)
 	if len(packet) > MAX_PACKET_SIZE {
-		log.Printf("Team %s state plus %d queued packets is %d bytes, over the %d byte limit; sending state only",
-			team.id, len(reply.Queue), len(packet), MAX_PACKET_SIZE)
+		log.Printf("Team %s reply is %d bytes, over the %d byte limit; sending state only",
+			team.id, len(packet), MAX_PACKET_SIZE)
 		reply.Queue = []string{}
 		packet = marshalPacket(reply)
 	}
@@ -288,6 +332,7 @@ func (r *Room) handleUpdateTeamState(env *Envelope) {
 	requesting := team.requestingState
 	team.state = string(env.State)
 	team.queue = nil
+	team.queueBytes = 0
 	team.requestingState = nil
 	team.droppedFromQueue = 0
 
@@ -379,6 +424,30 @@ func (s *clientStateSnapshot) packetFor(i int) string {
 // This runs on every join and every disconnect, so it is the hot path whenever
 // a client reconnect-loops in a busy room.
 func (r *Room) broadcastAllClientState() {
+	// Sending a snapshot can tear a client down (a full send queue is treated
+	// as a dead session), and that teardown broadcasts again. Left alone those
+	// nest one deep per dropped client, so a room whose clients all stall at
+	// once — a network hiccup is enough — rebuilds the whole snapshot once per
+	// client per level. Collapse that into at most one extra pass.
+	if r.broadcasting {
+		r.membershipDirty = true
+		return
+	}
+
+	r.broadcasting = true
+	defer func() {
+		r.broadcasting = false
+		r.membershipDirty = false
+	}()
+
+	r.sendClientStateSnapshot()
+	if r.membershipDirty {
+		r.membershipDirty = false
+		r.sendClientStateSnapshot() // reflect whoever dropped during the first pass
+	}
+}
+
+func (r *Room) sendClientStateSnapshot() {
 	if len(r.clients) == 0 {
 		return
 	}
