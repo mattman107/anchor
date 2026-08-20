@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -318,10 +317,72 @@ func (r *Room) broadcastTeam(from *Client, team *Team, env *Envelope) {
 	}
 }
 
+// clientStateSnapshot holds the ALL_CLIENT_STATE array built once, plus where
+// each member's own entry sits inside it, so a packet for any single member is
+// three copies rather than a re-parse of the whole snapshot.
+type clientStateSnapshot struct {
+	states string
+	starts []int
+	ends   []int
+}
+
+func newClientStateSnapshot(states []string) *clientStateSnapshot {
+	s := &clientStateSnapshot{
+		starts: make([]int, len(states)),
+		ends:   make([]int, len(states)),
+	}
+
+	var array strings.Builder
+	for i, state := range states {
+		if i > 0 {
+			array.WriteByte(',')
+		}
+		s.starts[i] = array.Len()
+		array.WriteString(state)
+		s.ends[i] = array.Len()
+	}
+	s.states = array.String()
+
+	return s
+}
+
+// packetFor returns the snapshot as member i sees it: every state, with only
+// entry i marked self.
+func (s *clientStateSnapshot) packetFor(i int) string {
+	const head = `{"type":"` + PacketAllClientState + `","state":[`
+	const tail = `]}`
+
+	// Only this member's own entry is rewritten, never the whole snapshot
+	self, _ := sjson.Set(s.states[s.starts[i]:s.ends[i]], "self", true)
+
+	var packet strings.Builder
+	packet.Grow(len(head) + s.starts[i] + len(self) + len(s.states) - s.ends[i] + len(tail))
+	packet.WriteString(head)
+	packet.WriteString(s.states[:s.starts[i]])
+	packet.WriteString(self)
+	packet.WriteString(s.states[s.ends[i]:])
+	packet.WriteString(tail)
+
+	return packet.String()
+}
+
 // broadcastAllClientState sends every member the same membership snapshot,
 // with only their own entry marked self. Running on the room goroutine makes
 // snapshot ordering automatic — two joins can't interleave their broadcasts.
+//
+// N packets each carrying N states is inherently O(N^2) bytes on the wire, but
+// it need not be O(N^2) work to build. The obvious version — join the states
+// once, then sjson.Set "state.<i>.self" per member — re-parses and re-copies
+// the entire snapshot N times over. Splicing instead brings allocation down to
+// the size of what is actually sent.
+//
+// This runs on every join and every disconnect, so it is the hot path whenever
+// a client reconnect-loops in a busy room.
 func (r *Room) broadcastAllClientState() {
+	if len(r.clients) == 0 {
+		return
+	}
+
 	members := make([]*Client, 0, len(r.clients))
 	states := make([]string, 0, len(r.clients))
 	for _, c := range r.clients {
@@ -329,10 +390,11 @@ func (r *Room) broadcastAllClientState() {
 		states = append(states, c.state)
 	}
 
-	packet := `{"type":"` + PacketAllClientState + `","state":[` + strings.Join(states, ",") + `]}`
+	snapshot := newClientStateSnapshot(states)
 	for i, c := range members {
-		withSelf, _ := sjson.Set(packet, "state."+strconv.Itoa(i)+".self", true)
-		c.send(PacketAllClientState, withSelf, false)
+		// One packet alive at a time: holding all N at once would put N^2
+		// bytes on the heap simultaneously
+		c.send(PacketAllClientState, snapshot.packetFor(i), false)
 	}
 }
 

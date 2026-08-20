@@ -12,11 +12,14 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tidwall/sjson"
 )
 
 const addr = "127.0.0.1:43383"
@@ -563,4 +566,101 @@ func TestSrvConsoleDeleteRoomStillWorks(t *testing.T) {
 	}
 	_ = r
 	t.Error("deleteRoom did not remove the room")
+}
+
+// oldBroadcastPacket is the previous implementation's output for member i:
+// join every state, then rewrite the whole snapshot to mark one entry. Kept
+// as the reference the optimised splice must match byte for byte.
+func oldBroadcastPacket(states []string, i int) string {
+	packet := `{"type":"` + PacketAllClientState + `","state":[` + strings.Join(states, ",") + `]}`
+	out, _ := sjson.Set(packet, "state."+strconv.Itoa(i)+".self", true)
+	return out
+}
+
+// Finding 1: the spliced snapshot must be byte-identical to what the previous
+// implementation produced, for every member, including states with commas and
+// brackets inside strings and states sjson cannot mark.
+func TestSrvBroadcastByteIdenticalToOld(t *testing.T) {
+	cases := [][]string{
+		{`{"clientId":1}`},
+		{`{"clientId":1}`, `{"clientId":2}`},
+		{`{"clientId":1,"a":"x"}`, `{"clientId":2}`, `{"clientId":3,"n":{"b":[1,2,3]}}`},
+		{`{"clientId":1,"s":"has,comma"}`, `{"clientId":2,"s":"]}"}`},
+		{`{"clientId":1,"s":"{\"nested\":\"json\"}"}`, `{"clientId":2}`},
+		{`{}`, `{"clientId":2}`, `{}`},
+		{`[1,2]`, `{"clientId":2}`}, // sjson refuses arrays; both forms must agree
+	}
+
+	for n, states := range cases {
+		snapshot := newClientStateSnapshot(states)
+		for i := range states {
+			got := snapshot.packetFor(i)
+			want := oldBroadcastPacket(states, i)
+			if got != want {
+				t.Errorf("case %d member %d:\n got: %s\nwant: %s", n, i, got, want)
+			}
+		}
+	}
+	t.Logf("%d snapshots match the previous implementation byte for byte", len(cases))
+}
+
+// Whatever the states, the packet stays parseable and marks exactly one self.
+func TestSrvBroadcastPacketShape(t *testing.T) {
+	states := []string{
+		`{"clientId":1,"scene":3}`,
+		`{"clientId":2,"items":{"a":1,"b":[1,2]}}`,
+		`{"clientId":3}`,
+	}
+	snapshot := newClientStateSnapshot(states)
+
+	for i := range states {
+		packet := snapshot.packetFor(i)
+		var decoded struct {
+			Type  string           `json:"type"`
+			State []map[string]any `json:"state"`
+		}
+		if err := json.Unmarshal([]byte(packet), &decoded); err != nil {
+			t.Fatalf("member %d: invalid JSON: %v\n%s", i, err, packet)
+		}
+		if decoded.Type != PacketAllClientState {
+			t.Errorf("member %d: type = %q", i, decoded.Type)
+		}
+		if len(decoded.State) != len(states) {
+			t.Fatalf("member %d: %d entries, want %d", i, len(decoded.State), len(states))
+		}
+		for j, entry := range decoded.State {
+			isSelf := entry["self"] == true
+			if isSelf != (j == i) {
+				t.Errorf("member %d: entry %d self=%v, want %v", i, j, isSelf, j == i)
+			}
+		}
+	}
+	t.Log("exactly one self marker, on the right entry, in every packet")
+}
+
+// The whole point: allocation should track what is sent, not N times it.
+func BenchmarkBroadcastAllClientState(b *testing.B) {
+	for _, n := range []int{8, 16, 32} {
+		states := make([]string, n)
+		for i := range states {
+			states[i] = `{"clientId":` + strconv.Itoa(i) + `,"pad":"` + strings.Repeat("x", 32*1024) + `"}`
+		}
+		b.Run("N="+strconv.Itoa(n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				snapshot := newClientStateSnapshot(states)
+				for j := range states {
+					_ = snapshot.packetFor(j)
+				}
+			}
+		})
+		b.Run("N="+strconv.Itoa(n)+"/old", func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				for j := range states {
+					_ = oldBroadcastPacket(states, j)
+				}
+			}
+		})
+	}
 }
