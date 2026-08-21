@@ -88,7 +88,9 @@ func (p *peer) drain(d time.Duration) {
 
 func onRoom(r *Room, fn func()) {
 	done := make(chan struct{})
-	if !r.post(func() { fn(); close(done) }) {
+	// Deferred: the room recovers panics, so a closure that panics would
+	// otherwise never close this and the test would hang instead of failing
+	if !r.post(func() { defer close(done); fn() }) {
 		return
 	}
 	<-done
@@ -1043,6 +1045,10 @@ func TestSrvDisplacedConnectionCannotWriteThrough(t *testing.T) {
 		if q := r.clients[7].queued.Load(); q < 1<<20 {
 			t.Skipf("only %d KB queued for A; test needs its writer wedged", q/1024)
 		}
+		// Age A out of ACTIVE_CLIENT_WINDOW so B is treated as a reconnect and
+		// takes the session over — an active A would instead be given its own
+		// id, which is TestSrvDuplicateIdGetsItsOwnId
+		r.clients[7].lastPacket = time.Now().Add(-time.Hour)
 	})
 
 	b := dial(t)
@@ -1065,34 +1071,149 @@ func TestSrvDisplacedConnectionCannotWriteThrough(t *testing.T) {
 	})
 }
 
-// Neither rival's session may leak while they trade the id back and forth.
-func TestSrvTakeoverChurnLeaksNothing(t *testing.T) {
-	const id = "dup-churn"
+// A second client configured with the same id as an active player must be
+// given its own id rather than fighting for that one. Before this, each side
+// kicked the other and reconnected forever, and every round broadcast the whole
+// room's membership to everybody in it.
+func TestSrvDuplicateIdGetsItsOwnId(t *testing.T) {
+	const id = "dup-id"
 
-	for i := 0; i < 4; i++ {
-		p := dial(t)
-		defer p.close()
-		p.handshake(id, 0)
-		go p.drain(10 * time.Second)
-	}
+	a := dial(t)
+	defer a.close()
+	a.handshake(id, 17)
+	go a.drain(20 * time.Second)
 	time.Sleep(200 * time.Millisecond)
 
-	takeovers := 0
-	deadline := time.Now().Add(500 * time.Millisecond)
+	b := dial(t)
+	defer b.close()
+	b.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":17,"roomState":{},"clientState":{"teamId":"B","isSaveLoaded":true}}`, id)
+	time.Sleep(300 * time.Millisecond)
+
+	r := room(t, id)
+	onRoom(r, func() {
+		if len(r.clients) != 2 {
+			t.Fatalf("expected both clients to be members, got %d", len(r.clients))
+		}
+		if a := r.clients[17]; a == nil || a.conn == nil || a.team.id != "1" {
+			t.Errorf("the active client lost its session to the duplicate: %+v", a)
+		}
+		for cid, c := range r.clients {
+			if cid == 17 {
+				continue
+			}
+			if c.conn == nil || c.team.id != "B" {
+				t.Errorf("duplicate got id %d but no working session: %+v", cid, c)
+			}
+			t.Logf("duplicate of id 17 was reassigned id %d", cid)
+		}
+	})
+}
+
+// The whole point: two rivals that both reconnect the moment they are kicked —
+// which is what the game mod does — must stop trading the id between them.
+// Before this they never settled, and every round broadcast the whole room's
+// membership to everybody in it.
+func TestSrvDuplicateIdDoesNotStartAWar(t *testing.T) {
+	const id = "dup-war"
+
+	watcher := dial(t)
+	defer watcher.close()
+	watcher.handshake(id, 0)
+	time.Sleep(200 * time.Millisecond)
+
+	// Two rivals both configured with clientId 7, each redialing whenever its
+	// socket dies and sending state updates in between like a live player
+	stop := make(chan struct{})
+	var reconnects atomic.Int64
+	var wg sync.WaitGroup
+	for _, team := range []string{"X", "Y"} {
+		wg.Add(1)
+		go func(team string) {
+			defer wg.Done()
+			for {
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					return
+				}
+				reconnects.Add(1)
+				fmt.Fprintf(c, `{"type":"HANDSHAKE","roomId":%q,"clientId":27,"roomState":{},"clientState":{"teamId":%q,"isSaveLoaded":true}}`+"\x00", id, team)
+				for {
+					select {
+					case <-stop:
+						c.Close()
+						return
+					default:
+					}
+					if _, err := c.Write([]byte(`{"type":"UPDATE_CLIENT_STATE","state":{"teamId":"` + team + `","isSaveLoaded":true}}` + "\x00")); err != nil {
+						break
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				c.Close()
+			}
+		}(team)
+	}
+
+	// Count membership snapshots reaching the uninvolved bystander
+	snapshots := 0
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, team := range []string{"X", "Y"} {
-			p := dial(t)
-			p.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":7,"roomState":{},"clientState":{"teamId":%q,"isSaveLoaded":true}}`, id, team)
-			takeovers++
-			p.conn.Close()
+		f := watcher.recv(500 * time.Millisecond)
+		if f == "" {
+			break
+		}
+		if strings.Contains(f, PacketAllClientState) {
+			snapshots++
 		}
 	}
-	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
 
-	writers, readers := stacks("(*Client).writeLoop"), stacks("handleConnection")
-	t.Logf("%d takeovers -> %d writeLoops, %d readers still alive", takeovers, writers, readers)
-	// One session per bystander, plus at most the last winner
-	if writers > 6 || readers > 6 {
-		t.Errorf("takeover churn left %d writeLoops and %d readers behind", writers, readers)
+	// Three joins is three snapshots. A war reconnects as fast as the network
+	// allows and broadcasts every time.
+	t.Logf("%d reconnects, %d membership snapshots reached the bystander", reconnects.Load(), snapshots)
+	if snapshots > 20 || reconnects.Load() > 6 {
+		t.Errorf("%d snapshots from %d reconnects — the rivals are still trading the id",
+			snapshots, reconnects.Load())
+	}
+}
+
+// The takeover exists for reconnects, and giving duplicates their own id must
+// not cost a real reconnect its identity — in either of the two shapes it
+// arrives in: the socket already closed (process died), or the server not yet
+// having noticed (network dropped).
+func TestSrvReconnectKeepsItsId(t *testing.T) {
+	for i, dropSocket := range []bool{true, false} {
+		id := fmt.Sprintf("reconnect-%v", dropSocket)
+		// Ids are unique server-wide, so each case needs its own
+		cid := uint64(900 + i)
+
+		first := dial(t)
+		first.handshake(id, cid)
+		time.Sleep(300 * time.Millisecond)
+		rm := room(t, id)
+
+		if dropSocket {
+			first.close()
+			time.Sleep(300 * time.Millisecond)
+		} else {
+			// Still bound server-side, but silent since it went — which is
+			// exactly how a dropped connection looks from here
+			defer first.close()
+			onRoom(rm, func() { rm.clients[cid].lastPacket = time.Now().Add(-time.Hour) })
+		}
+
+		again := dial(t)
+		defer again.close()
+		again.handshake(id, cid)
+		time.Sleep(400 * time.Millisecond)
+
+		onRoom(rm, func() {
+			c := rm.clients[cid]
+			t.Logf("dropSocket=%v: %d member(s), id %d bound=%v", dropSocket, len(rm.clients), cid, c != nil && c.conn != nil)
+			if len(rm.clients) != 1 || c == nil || c.conn == nil {
+				t.Errorf("dropSocket=%v: reconnect did not resume id %d", dropSocket, cid)
+			}
+		})
 	}
 }

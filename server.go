@@ -22,6 +22,13 @@ const HEARTBEAT = 30 * time.Second
 // shared one people idle in — r.clients would otherwise grow with everyone who
 // has ever joined, and every membership snapshot grows with it.
 const CLIENT_RETENTION = 5 * time.Hour
+
+// ACTIVE_CLIENT_WINDOW is how recently a client must have SENT something for
+// its session to count as still in use. Anchor relays live player movement, so
+// a client that is actually playing is never quiet for this long; a client the
+// server has not yet noticed is gone has been quiet since the moment it went.
+// That is what separates a duplicate id from a reconnect — see Room.join.
+const ACTIVE_CLIENT_WINDOW = 5 * time.Second
 const MAX_PACKET_SIZE = 8 * 1024 * 1024
 const INITIAL_SCAN_BUFFER = 64 * 1024
 
@@ -372,9 +379,10 @@ func (s *Server) joinRoom(env *Envelope, conn net.Conn) (*Client, *Room) {
 }
 
 // resolveClientId decides which id a handshake gets. An id that is currently
-// online in the same room is the same player reconnecting — the room will take
-// over the stale session. An id online in a different room isn't theirs, so a
-// fresh one is minted (ids are globally unique per server).
+// online in the same room may be the same player reconnecting, so it is allowed
+// through here and the room decides — see Room.join. An id online in a
+// different room isn't theirs, so a fresh one is minted (ids are globally
+// unique per server).
 func (s *Server) resolveClientId(requested uint64, roomId string) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -386,6 +394,20 @@ func (s *Server) resolveClientId(requested uint64, roomId string) uint64 {
 		}
 	}
 
+	return s.freshClientId()
+}
+
+// mintClientId hands out an unused id. Called from a room goroutine when a
+// handshake turns out to be a duplicate rather than a reconnect.
+func (s *Server) mintClientId() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.freshClientId()
+}
+
+// freshClientId must be called with mu held.
+func (s *Server) freshClientId() uint64 {
 	for {
 		id := s.nextClientId.Add(1)
 		if _, taken := s.clientRooms[id]; !taken {

@@ -38,6 +38,10 @@ type Client struct {
 	saveLoaded   bool   // mirrored out of the blob for REQUEST_TEAM_STATE decisions
 	online       bool
 	lastActivity time.Time
+	// lastPacket is the last time this client SENT something. lastActivity
+	// moves on traffic in either direction, so it says nothing about whether
+	// the client is still there; this does. See Room.join.
+	lastPacket time.Time
 }
 
 // send enqueues a packet for the client's writer goroutine. It never blocks; a

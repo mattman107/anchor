@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -165,22 +166,42 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 		return nil
 	}
 
-	fields := parseClientStateFields(env.ClientState)
-	state, _ := sjson.Set(string(env.ClientState), "clientId", clientId)
+	requested := clientId
+	duplicate := false
 
 	c := r.clients[clientId]
-	if c == nil {
-		c = &Client{id: clientId, room: r}
-		r.clients[clientId] = c
-	} else if c.conn != nil {
-		log.Printf("Client %v reconnected, closing stale session\n", clientId)
+	switch {
+	case c == nil:
+
+	case c.conn != nil && time.Since(c.lastPacket) < ACTIVE_CLIENT_WINDOW:
+		// Somebody is playing under this id right now, so this handshake is not
+		// them reconnecting — it is a second client configured with the same
+		// id, which happens when a player edits it by hand. Taking the session
+		// over would start a war: each client kicks the other, reconnects, and
+		// kicks it back, broadcasting the whole room's membership every round.
+		// Ids belong to the server, so hand this one a different one instead.
+		clientId = r.server.mintClientId()
+		duplicate = true
+		c = nil
+
+	case c.conn != nil:
+		// Quiet incumbent: this is the reconnect case the takeover exists for.
 		// Close now rather than letting the stale writer drain first. Draining
 		// can take 10s per queued packet, and for all that time the displaced
 		// connection's reader is still alive and still posting packets against
 		// this client. Nothing queued for a session being displaced is worth
 		// delivering anyway.
+		log.Printf("Client %v reconnected, closing stale session\n", clientId)
 		c.conn.Close()
 		r.detach(c)
+	}
+
+	fields := parseClientStateFields(env.ClientState)
+	state, _ := sjson.Set(string(env.ClientState), "clientId", clientId)
+
+	if c == nil {
+		c = &Client{id: clientId, room: r}
+		r.clients[clientId] = c
 	}
 
 	c.conn = conn
@@ -191,6 +212,7 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 	c.saveLoaded = fields.IsSaveLoaded
 	c.online = true
 	c.lastActivity = time.Now()
+	c.lastPacket = c.lastActivity // the handshake itself is inbound traffic
 	go c.writeLoop(conn, c.sendCh, c.queued)
 
 	r.server.setClientRoom(clientId, r)
@@ -198,6 +220,14 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 
 	roomState, _ := sjson.SetRaw(`{"type":"UPDATE_ROOM_STATE"}`, "state", r.state)
 	c.send(PacketUpdateRoomState, roomState, false)
+
+	if duplicate {
+		log.Printf("Client id %v is in use by an active connection in room %s; assigned %v instead\n",
+			requested, r.id, clientId)
+		c.sendServerMessage(fmt.Sprintf(
+			"Client ID %d is already in use in this room, so you were given ID %d. Change your client ID in settings to keep it.",
+			requested, clientId))
+	}
 
 	return c
 }
@@ -247,6 +277,7 @@ func (r *Room) handlePacket(c *Client, conn net.Conn, env *Envelope) {
 	}
 
 	c.lastActivity = time.Now()
+	c.lastPacket = c.lastActivity
 
 	if !r.server.quietMode.Load() && !env.Quiet {
 		log.Printf("Client %d -> Server: %s\n", c.id, env.Type)

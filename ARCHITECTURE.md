@@ -58,7 +58,20 @@ the complete list of packets the server originates.
   notified the room.)
 - **Sender identity is server-side.** Broadcast exclusion uses the client the
   connection actually belongs to, not the `clientId` written in the packet, so
-  a client can't spoof another's identity.
+  a client can't spoof another's identity. `handlePacket` also drops packets
+  from a connection that is no longer the client's, which matters because the
+  displaced reader of a taken-over session keeps running until its socket
+  closes.
+- **A duplicate clientId is reassigned, not fought over.** Two clients claiming
+  the same id look identical to one client reconnecting. `Room.join` separates
+  them by whether the incumbent has *sent* anything recently
+  (`Client.lastPacket`, window `ACTIVE_CLIENT_WINDOW`): a client that is
+  actually playing is never quiet, and a client that is gone has been quiet
+  since it went. An active incumbent keeps its session and the newcomer is
+  minted a fresh id; a quiet one is taken over, which is the reconnect the
+  takeover exists for. Without this split, two clients with a hand-edited
+  matching id kick each other and reconnect forever, broadcasting the room's
+  whole membership every round.
 - **Per-event panic isolation.** A panic in one packet handler kills that event,
   not the room (and not the server). The console dispatches each command the
   same way. This only works if no lock can be left held: because a recovered
