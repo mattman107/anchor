@@ -16,19 +16,25 @@ import (
 
 const INACTIVITY_TIMEOUT = 5 * time.Minute
 const HEARTBEAT = 30 * time.Second
+
+// CLIENT_RETENTION is how long an offline client stays a member of its room.
+// A room with anyone connected never expires, so in a long-lived room — the
+// shared one people idle in — r.clients would otherwise grow with everyone who
+// has ever joined, and every membership snapshot grows with it.
+const CLIENT_RETENTION = 5 * time.Hour
 const MAX_PACKET_SIZE = 8 * 1024 * 1024
 const INITIAL_SCAN_BUFFER = 64 * 1024
 
 type Server struct {
-	listener          net.Listener
 	quietMode         atomic.Bool
 	gameCompleteCount atomic.Uint64
 	nextClientId      atomic.Uint64
 
-	// mu guards only the two registries below. All game state lives inside
-	// rooms, owned by their goroutines; nothing ever holds mu while waiting on
-	// a room, so there is no lock ordering to get wrong.
+	// mu guards the listener and the two registries below. All game state
+	// lives inside rooms, owned by their goroutines; nothing ever holds mu
+	// while waiting on a room, so there is no lock ordering to get wrong.
 	mu          sync.Mutex
+	listener    net.Listener
 	rooms       map[string]*Room
 	clientRooms map[uint64]*Room // which room each *online* client is in
 }
@@ -58,7 +64,7 @@ func (s *Server) Start() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s.listener = listener
+	s.setListener(listener)
 
 	s.parseStats()
 
@@ -220,11 +226,41 @@ func (s *Server) saveStats() {
 	}
 }
 
+// setListener publishes the listener. processStdin and the signal handler are
+// both running before Start gets here, and either can call shutdown, so this
+// field is shared and needs mu like any other.
+func (s *Server) setListener(l net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.listener = l
+}
+
+// closeListener stops accepting new connections. It is a no-op when Start has
+// not published a listener yet — a stop that arrives during startup is still a
+// stop, and the socket goes away with the process either way.
+func (s *Server) closeListener() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.listener != nil {
+		s.listener.Close()
+	}
+}
+
 // shutdown persists stats, stops accepting connections, and exits.
+//
+// The exit is deferred so that it happens even if something above it panics.
+// Console commands and room events run under recover(), and a stop request
+// that logs a panic and then leaves the server running — with stdin possibly
+// already at EOF, so no console left to retry from — is worse than a messy
+// exit.
 func (s *Server) shutdown() {
+	defer os.Exit(0)
+	defer logPanic("shutdown")
+
 	s.saveStats()
-	s.listener.Close()
-	os.Exit(0)
+	s.closeListener()
 }
 
 func (s *Server) cleanupInactiveRooms() {

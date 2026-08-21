@@ -812,3 +812,113 @@ func TestSrvRequestingStateDeduped(t *testing.T) {
 		t.Errorf("expected 1 entry, got %d", len(team.requestingState))
 	}
 }
+
+// #1: shutdown must survive being called before Start publishes the listener,
+// and must not be silently swallowed by a recover when it does.
+func TestSrvCloseListenerBeforeStart(t *testing.T) {
+	s := NewServer() // no Start, so no listener
+	s.closeListener()
+	s.closeListener() // and again, still no panic
+	t.Log("closeListener on a server that never bound is a no-op")
+}
+
+// The console path is what actually races startup: processStdin is running
+// before Start assigns the listener, and `stop` calls shutdown.
+func TestSrvStopBeforeListenerDoesNotPanic(t *testing.T) {
+	s := NewServer()
+
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	// runConsoleCommand's recover would hide a nil deref here, so assert on
+	// the log rather than on a panic escaping.
+	s.closeListener()
+	log.SetOutput(os.Stderr)
+
+	if strings.Contains(logs.String(), "Panic in") {
+		t.Errorf("closing an unpublished listener panicked: %s", logs.String())
+	}
+}
+
+// #2: offline clients are forgotten after CLIENT_RETENTION; present ones stay.
+func TestSrvPrunesLongOfflineClients(t *testing.T) {
+	r := NewRoom(testServer, "prune-room", 1, "{}")
+
+	// offline and long past retention
+	r.clients[1] = &Client{id: 1, room: r, state: `{"clientId":1}`,
+		lastActivity: time.Now().Add(-CLIENT_RETENTION - time.Minute)}
+	// offline but recent
+	r.clients[2] = &Client{id: 2, room: r, state: `{"clientId":2}`,
+		lastActivity: time.Now().Add(-time.Minute)}
+	// connected, and stale-looking: must never be pruned out from under a
+	// live socket, whatever lastActivity says
+	r.clients[3] = &Client{id: 3, room: r, state: `{"clientId":3}`, conn: fakeConn{},
+		sendCh: make(chan string, 8), online: true,
+		lastActivity: time.Now().Add(-24 * time.Hour)}
+
+	if !r.pruneStaleClients() {
+		t.Fatal("expected the long-offline client to be pruned")
+	}
+	if _, still := r.clients[1]; still {
+		t.Error("client offline past retention was kept")
+	}
+	if _, ok := r.clients[2]; !ok {
+		t.Error("recently offline client was pruned")
+	}
+	if _, ok := r.clients[3]; !ok {
+		t.Error("connected client was pruned")
+	}
+
+	if r.pruneStaleClients() {
+		t.Error("second pass should find nothing to prune")
+	}
+	t.Logf("retention %v: 1 forgotten, %d kept", CLIENT_RETENTION, len(r.clients))
+}
+
+// A pruned client reconnecting is a fresh member, and the team's saved state
+// survives independently of it.
+func TestSrvPrunedClientCanRejoin(t *testing.T) {
+	const id = "rejoin-room"
+	p := dial(t)
+	defer p.close()
+	p.handshake(id, 960001)
+	p.recv(time.Second)
+
+	r := room(t, id)
+	onRoom(r, func() {
+		r.findOrCreateTeam("1").state = `{"saved":true}`
+	})
+	p.close()
+	time.Sleep(200 * time.Millisecond)
+
+	// Age the disconnected client past retention, then sweep.
+	onRoom(r, func() {
+		if c := r.clients[960001]; c != nil {
+			c.lastActivity = time.Now().Add(-CLIENT_RETENTION - time.Minute)
+		}
+	})
+	onRoom(r, func() { r.pruneStaleClients() })
+
+	var gone bool
+	onRoom(r, func() { _, ok := r.clients[960001]; gone = !ok })
+	if !gone {
+		t.Fatal("client was not pruned")
+	}
+
+	q := dial(t)
+	defer q.close()
+	q.handshake(id, 960001)
+	if q.recv(2*time.Second) == "" {
+		t.Fatal("pruned client could not rejoin")
+	}
+
+	var teamState string
+	var members int
+	onRoom(r, func() {
+		teamState = r.findOrCreateTeam("1").state
+		members = len(r.clients)
+	})
+	if teamState != `{"saved":true}` {
+		t.Errorf("team state lost: %q", teamState)
+	}
+	t.Logf("rejoined as a fresh member (%d in room), team state intact", members)
+}

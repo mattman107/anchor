@@ -467,10 +467,38 @@ func (r *Room) sendClientStateSnapshot() {
 	}
 }
 
+// pruneStaleClients forgets clients that went offline longer than
+// CLIENT_RETENTION ago. Offline clients are kept so a reconnect resumes the
+// same id, but a room that always has someone in it never expires, so without
+// an upper bound its membership — and every snapshot built from it — grows
+// with the number of players who have ever joined rather than who is present.
+//
+// A pruned client can still reconnect; it just arrives as a new member with
+// the state from its handshake. Team save state lives on the Team, not here.
+func (r *Room) pruneStaleClients() bool {
+	pruned := 0
+	for id, c := range r.clients {
+		if c.conn == nil && time.Since(c.lastActivity) > CLIENT_RETENTION {
+			delete(r.clients, id)
+			pruned++
+		}
+	}
+
+	if pruned > 0 {
+		log.Printf("Room %s forgot %d client(s) offline for over %v", r.id, pruned, CLIENT_RETENTION)
+	}
+
+	return pruned > 0
+}
+
 // sweepIfInactive shuts the room down when nothing has happened in it for
 // INACTIVITY_TIMEOUT. Connected clients are heartbeated every HEARTBEAT, which
 // counts as activity, so only rooms with no live connections expire.
 func (r *Room) sweepIfInactive() {
+	if r.pruneStaleClients() {
+		r.broadcastAllClientState()
+	}
+
 	// Seeded with creation time so a room that exists but has not finished its
 	// first join yet isn't swept the instant it appears
 	last := r.created
