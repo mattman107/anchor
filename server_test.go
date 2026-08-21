@@ -413,7 +413,7 @@ func TestSrvStatsNeverWritesToALiveConn(t *testing.T) {
 	go r.run()
 	defer func() { onRoom(r, r.shutdown) }()
 
-	c := &Client{id: 1, room: r, conn: srv2, sendCh: make(chan string, 4), online: true}
+	c := &Client{id: 1, room: r, conn: srv2, sendCh: make(chan string, 4), queued: &atomic.Int64{}, online: true}
 	onRoom(r, func() { r.clients[1] = c })
 
 	// Run it off-goroutine: net.Pipe is synchronous, so a stray direct write
@@ -683,7 +683,7 @@ func TestSrvBroadcastDoesNotNestPerDrop(t *testing.T) {
 			// unbuffered: every send takes the "queue full" branch
 			r.clients[uint64(i)] = &Client{
 				id: uint64(i), room: r, state: state,
-				sendCh: make(chan string), conn: fakeConn{}, online: true,
+				sendCh: make(chan string), queued: &atomic.Int64{}, conn: fakeConn{}, online: true,
 			}
 		}
 
@@ -769,7 +769,7 @@ func TestSrvTeamReplyDoesNotOverAllocate(t *testing.T) {
 		team.enqueue(packet)
 	}
 
-	c := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 4)}
+	c := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 4), queued: &atomic.Int64{}}
 	r.clients[1] = c
 
 	var before, after runtime.MemStats
@@ -798,8 +798,8 @@ func TestSrvRequestingStateDeduped(t *testing.T) {
 	r := NewRoom(testServer, "req-room", 1, "{}")
 	team := r.findOrCreateTeam("t")
 
-	asker := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 8192), team: team}
-	mate := &Client{id: 2, room: r, state: `{"clientId":2}`, sendCh: make(chan string, 8192),
+	asker := &Client{id: 1, room: r, state: `{"clientId":1}`, sendCh: make(chan string, 8192), queued: &atomic.Int64{}, team: team}
+	mate := &Client{id: 2, room: r, state: `{"clientId":2}`, sendCh: make(chan string, 8192), queued: &atomic.Int64{},
 		team: team, saveLoaded: true, conn: fakeConn{}}
 	r.clients[1], r.clients[2] = asker, mate
 
@@ -852,7 +852,7 @@ func TestSrvPrunesLongOfflineClients(t *testing.T) {
 	// connected, and stale-looking: must never be pruned out from under a
 	// live socket, whatever lastActivity says
 	r.clients[3] = &Client{id: 3, room: r, state: `{"clientId":3}`, conn: fakeConn{},
-		sendCh: make(chan string, 8), online: true,
+		sendCh: make(chan string, 8), queued: &atomic.Int64{}, online: true,
 		lastActivity: time.Now().Add(-24 * time.Hour)}
 
 	if !r.pruneStaleClients() {
@@ -921,4 +921,92 @@ func TestSrvPrunedClientCanRejoin(t *testing.T) {
 		t.Errorf("team state lost: %q", teamState)
 	}
 	t.Logf("rejoined as a fresh member (%d in room), team state intact", members)
+}
+
+// The per-client send queue must be bounded in bytes, not just in packets:
+// sendQueueSize packets of MAX_PACKET_SIZE would be gigabytes per connection.
+func TestSrvSendQueueBoundedInBytes(t *testing.T) {
+	r := NewRoom(testServer, "sendq-room", 1, "{}")
+	slow := &Client{id: 1, room: r, state: `{"clientId":1}`,
+		sendCh: make(chan string, sendQueueSize), queued: &atomic.Int64{},
+		conn: fakeConn{}, online: true}
+	r.clients[1] = slow
+
+	// Hold the channel: disconnect nils the client's reference, so measuring
+	// slow.sendCh afterwards would just be len(nil).
+	ch := slow.sendCh
+	counter := slow.queued
+
+	packet := strings.Repeat("p", 256*1024)
+	sends := 0
+	for i := 0; i < sendQueueSize && slow.sendCh != nil; i++ {
+		slow.send("RELAY", packet, true)
+		sends++
+	}
+
+	held := 0
+	for len(ch) > 0 {
+		held += len(<-ch)
+	}
+	t.Logf("%d sends of %d KB -> %d MB held, counter said %d MB (bound %d MB); online=%v",
+		sends, len(packet)/1024, held/(1<<20), counter.Load()/(1<<20),
+		MAX_QUEUED_BYTES/(1<<20), slow.online)
+
+	if held > MAX_QUEUED_BYTES {
+		t.Errorf("queue held %d bytes, over the %d byte bound", held, MAX_QUEUED_BYTES)
+	}
+	if held == 0 {
+		t.Error("nothing was queued; the test measured the wrong thing")
+	}
+	if slow.online {
+		t.Error("a client that never drains should have been dropped")
+	}
+	// Without the byte bound this would have been sendQueueSize * 256 KB.
+	if sends >= sendQueueSize {
+		t.Errorf("filled the whole %d-packet queue; the byte bound never bit", sendQueueSize)
+	}
+}
+
+// Real-time traffic is small; the byte bound must give it more room than the
+// old 256-packet cap, not less, so a brief hiccup doesn't drop live players.
+func TestSrvSmallPacketHeadroom(t *testing.T) {
+	r := NewRoom(testServer, "headroom-room", 1, "{}")
+	c := &Client{id: 1, room: r, state: `{"clientId":1}`,
+		sendCh: make(chan string, sendQueueSize), queued: &atomic.Int64{},
+		conn: fakeConn{}, online: true}
+	r.clients[1] = c
+
+	// A position update is a few hundred bytes.
+	update := `{"type":"UPDATE_CLIENT_STATE","quiet":true,"state":{"pos":` + strings.Repeat("0", 200) + `}}`
+	accepted := 0
+	for i := 0; i < sendQueueSize*2 && c.sendCh != nil; i++ {
+		c.send("UPDATE_CLIENT_STATE", update, true)
+		if c.sendCh != nil {
+			accepted++
+		}
+	}
+
+	t.Logf("queued %d position updates of %d bytes before the bound bit (old cap was 256 packets)",
+		accepted, len(update))
+	if accepted <= 256 {
+		t.Errorf("only %d small packets buffered, worse than the old 256-packet cap", accepted)
+	}
+}
+
+// A single oversized packet must never be fatal on an empty queue.
+func TestSrvOversizePacketOnEmptyQueue(t *testing.T) {
+	r := NewRoom(testServer, "oversize-room", 1, "{}")
+	c := &Client{id: 1, room: r, state: `{"clientId":1}`,
+		sendCh: make(chan string, sendQueueSize), queued: &atomic.Int64{},
+		conn: fakeConn{}, online: true}
+	r.clients[1] = c
+
+	c.send("BIG", strings.Repeat("x", MAX_QUEUED_BYTES+1024), false)
+	if !c.online || c.sendCh == nil {
+		t.Fatal("an oversized packet on an empty queue must not drop the session")
+	}
+	if len(c.sendCh) != 1 {
+		t.Fatalf("expected the packet to be queued, depth=%d", len(c.sendCh))
+	}
+	t.Log("oversized packet accepted on an empty queue")
 }

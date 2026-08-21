@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/sjson"
@@ -178,12 +179,13 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 
 	c.conn = conn
 	c.sendCh = make(chan string, sendQueueSize)
+	c.queued = &atomic.Int64{}
 	c.state = state
 	c.team = r.findOrCreateTeam(fields.TeamID)
 	c.saveLoaded = fields.IsSaveLoaded
 	c.online = true
 	c.lastActivity = time.Now()
-	go c.writeLoop(conn, c.sendCh)
+	go c.writeLoop(conn, c.sendCh, c.queued)
 
 	r.server.setClientRoom(clientId, r)
 	r.broadcastAllClientState()
@@ -200,6 +202,7 @@ func (r *Room) detach(c *Client) {
 	if c.sendCh != nil {
 		close(c.sendCh)
 		c.sendCh = nil
+		c.queued = nil // the old writeLoop keeps its own reference to drain
 	}
 	c.conn = nil
 }
