@@ -1010,3 +1010,89 @@ func TestSrvOversizePacketOnEmptyQueue(t *testing.T) {
 	}
 	t.Log("oversized packet accepted on an empty queue")
 }
+
+// Two clients claiming the same clientId in the same room look exactly like one
+// client reconnecting, so the second takes the first over. The displaced
+// connection's reader is a separate goroutine that lives until its socket
+// closes, and it must stop speaking for the client the moment it is displaced —
+// otherwise the old session writes its team, position and save flags over the
+// new one's, which is what "both players acting strange" looks like in game.
+func TestSrvDisplacedConnectionCannotWriteThrough(t *testing.T) {
+	const id = "dup-takeover"
+
+	// A never reads, so its writer backs up and its socket stays open long
+	// enough for the race to be observable rather than a coin flip
+	a := dial(t)
+	defer a.close()
+	a.handshake(id, 7)
+
+	filler := dial(t)
+	defer filler.close()
+	filler.handshake(id, 0)
+	go filler.drain(30 * time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	pad := strings.Repeat("z", 256*1024)
+	for i := 0; i < 40; i++ {
+		filler.send(`{"type":"JUNK","pad":%q}`, pad)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	r := room(t, id)
+	onRoom(r, func() {
+		if q := r.clients[7].queued.Load(); q < 1<<20 {
+			t.Skipf("only %d KB queued for A; test needs its writer wedged", q/1024)
+		}
+	})
+
+	b := dial(t)
+	defer b.close()
+	b.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":7,"roomState":{},"clientState":{"teamId":"B","isSaveLoaded":true}}`, id)
+	time.Sleep(200 * time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		a.send(`{"type":"UPDATE_CLIENT_STATE","state":{"teamId":"GHOST","isSaveLoaded":true,"marker":"displaced"}}`)
+		time.Sleep(30 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	onRoom(r, func() {
+		c := r.clients[7]
+		t.Logf("client 7 after displaced writes: team=%s state=%s", c.team.id, c.state)
+		if strings.Contains(c.state, "displaced") || c.team.id != "B" {
+			t.Errorf("displaced connection wrote through into the live session")
+		}
+	})
+}
+
+// Neither rival's session may leak while they trade the id back and forth.
+func TestSrvTakeoverChurnLeaksNothing(t *testing.T) {
+	const id = "dup-churn"
+
+	for i := 0; i < 4; i++ {
+		p := dial(t)
+		defer p.close()
+		p.handshake(id, 0)
+		go p.drain(10 * time.Second)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	takeovers := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, team := range []string{"X", "Y"} {
+			p := dial(t)
+			p.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":7,"roomState":{},"clientState":{"teamId":%q,"isSaveLoaded":true}}`, id, team)
+			takeovers++
+			p.conn.Close()
+		}
+	}
+	time.Sleep(2 * time.Second)
+
+	writers, readers := stacks("(*Client).writeLoop"), stacks("handleConnection")
+	t.Logf("%d takeovers -> %d writeLoops, %d readers still alive", takeovers, writers, readers)
+	// One session per bystander, plus at most the last winner
+	if writers > 6 || readers > 6 {
+		t.Errorf("takeover churn left %d writeLoops and %d readers behind", writers, readers)
+	}
+}

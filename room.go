@@ -174,6 +174,12 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 		r.clients[clientId] = c
 	} else if c.conn != nil {
 		log.Printf("Client %v reconnected, closing stale session\n", clientId)
+		// Close now rather than letting the stale writer drain first. Draining
+		// can take 10s per queued packet, and for all that time the displaced
+		// connection's reader is still alive and still posting packets against
+		// this client. Nothing queued for a session being displaced is worth
+		// delivering anyway.
+		c.conn.Close()
 		r.detach(c)
 	}
 
@@ -229,7 +235,17 @@ func (r *Room) disconnect(c *Client, conn net.Conn) {
 // handlePacket applies server-side effects, then routes: a target client wins,
 // then packet types the server interprets, then team-addressed packets, then
 // a room broadcast.
-func (r *Room) handlePacket(c *Client, env *Envelope) {
+func (r *Room) handlePacket(c *Client, conn net.Conn, env *Envelope) {
+	// A reconnect takes the client over, but the displaced connection's reader
+	// is a separate goroutine that keeps reading until its socket closes. Until
+	// then it is still posting packets for this client, and applying them would
+	// let the old session write into the new one's state — a client's team,
+	// position and save flags all get overwritten by whatever the displaced
+	// connection sends. Same conn-identity check disconnect uses.
+	if c.conn != conn {
+		return
+	}
+
 	c.lastActivity = time.Now()
 
 	if !r.server.quietMode.Load() && !env.Quiet {

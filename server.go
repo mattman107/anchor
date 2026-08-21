@@ -319,7 +319,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		room.post(func() { room.handlePacket(client, env) })
+		room.post(func() { room.handlePacket(client, conn, env) })
 	}
 
 	if client != nil {
