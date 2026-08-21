@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -166,9 +165,6 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 		return nil
 	}
 
-	requested := clientId
-	duplicate := false
-
 	c := r.clients[clientId]
 	switch {
 	case c == nil:
@@ -180,8 +176,10 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 		// over would start a war: each client kicks the other, reconnects, and
 		// kicks it back, broadcasting the whole room's membership every round.
 		// Ids belong to the server, so hand this one a different one instead.
-		clientId = r.server.mintClientId()
-		duplicate = true
+		fresh := r.server.mintClientId()
+		log.Printf("Client id %v is in use by an active connection in room %s; assigned %v instead\n",
+			clientId, r.id, fresh)
+		clientId = fresh
 		c = nil
 
 	case c.conn != nil:
@@ -220,14 +218,6 @@ func (r *Room) join(clientId uint64, env *Envelope, conn net.Conn) *Client {
 
 	roomState, _ := sjson.SetRaw(`{"type":"UPDATE_ROOM_STATE"}`, "state", r.state)
 	c.send(PacketUpdateRoomState, roomState, false)
-
-	if duplicate {
-		log.Printf("Client id %v is in use by an active connection in room %s; assigned %v instead\n",
-			requested, r.id, clientId)
-		c.sendServerMessage(fmt.Sprintf(
-			"Client ID %d is already in use in this room, so you were given ID %d. Change your client ID in settings to keep it.",
-			requested, clientId))
-	}
 
 	return c
 }

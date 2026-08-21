@@ -68,8 +68,8 @@ the complete list of packets the server originates.
   (`Client.lastPacket`, window `ACTIVE_CLIENT_WINDOW`): a client that is
   actually playing is never quiet, and a client that is gone has been quiet
   since it went. An active incumbent keeps its session and the newcomer is
-  minted a fresh id; a quiet one is taken over, which is the reconnect the
-  takeover exists for. Without this split, two clients with a hand-edited
+  minted a fresh id, the same way any client arriving without one is; a quiet
+  incumbent is taken over, which is the reconnect the takeover exists for. Without this split, two clients with a hand-edited
   matching id kick each other and reconnect forever, broadcasting the room's
   whole membership every round.
 - **Per-event panic isolation.** A panic in one packet handler kills that event,

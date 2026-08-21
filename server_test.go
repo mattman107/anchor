@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -1216,4 +1217,61 @@ func TestSrvReconnectKeepsItsId(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A reassigned client is not told in words, so the only way it learns its new
+// id is the one every client uses: its own entry in ALL_CLIENT_STATE, marked
+// self. That entry must carry the id the server actually assigned.
+func TestSrvReassignedClientLearnsItsNewId(t *testing.T) {
+	const id = "dup-learn"
+
+	a := dial(t)
+	defer a.close()
+	a.handshake(id, 37)
+	go a.drain(20 * time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	b := dial(t)
+	defer b.close()
+	b.send(`{"type":"HANDSHAKE","roomId":%q,"clientId":37,"roomState":{},"clientState":{"teamId":"B","isSaveLoaded":true}}`, id)
+	time.Sleep(300 * time.Millisecond)
+
+	// Whatever the server decided
+	var assigned uint64
+	onRoom(room(t, id), func() {
+		for cid := range room(t, id).clients {
+			if cid != 37 {
+				assigned = cid
+			}
+		}
+	})
+	if assigned == 0 || assigned == 37 {
+		t.Fatalf("duplicate was not reassigned (got id %d)", assigned)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := b.recv(time.Second)
+		if frame == "" {
+			break
+		}
+		if !strings.Contains(frame, PacketAllClientState) {
+			continue
+		}
+		var got []uint64
+		for _, entry := range gjson.Get(frame, "state").Array() {
+			if entry.Get("self").Bool() {
+				got = append(got, entry.Get("clientId").Uint())
+			}
+		}
+		t.Logf("server assigned %d; self entries in ALL_CLIENT_STATE: %v", assigned, got)
+		if len(got) != 1 {
+			t.Fatalf("expected exactly one self entry, got %v", got)
+		}
+		if got[0] != assigned {
+			t.Fatalf("client was told id %d but the server assigned %d", got[0], assigned)
+		}
+		return
+	}
+	t.Fatal("reassigned client never received an ALL_CLIENT_STATE telling it its id")
 }
